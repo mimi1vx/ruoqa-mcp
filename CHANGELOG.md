@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.1.1...v0.1.2) - 2026-08-04
+
+### Added
+
+- *(cli)* add --version/-V flag
+
+### Other
+
+- stop tracking plans/ directory
+
 ## [0.1.1](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.1.0...v0.1.1) - 2026-08-04
 
 ### Other
