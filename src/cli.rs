@@ -6,7 +6,7 @@ use clap::Parser;
 
 /// Run the openQA MCP server over stdio (default) or HTTP.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "ruoqa-mcp")]
+#[command(name = "ruoqa-mcp", version)]
 pub struct Cli {
     /// Serve over HTTP instead of stdio.
     #[arg(long, conflicts_with = "stdio")]
@@ -78,6 +78,10 @@ mod tests {
 
         let err = Cli::try_parse_from(["ruoqa-mcp", "--http", "--stdio"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = Cli::try_parse_from(["ruoqa-mcp", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
 
         assert!(!Cli::parse_from(["ruoqa-mcp", "--stdio"]).use_http());
         assert!(Cli::parse_from(["ruoqa-mcp", "--readonly"]).readonly());

@@ -196,6 +196,7 @@ The MCP endpoint is mounted at `/mcp`.
 | `--server` | `127.0.0.1` | HTTP bind host. |
 | `--port` | `8000` | HTTP bind port. |
 | `--readonly` | off | Unregister all mutating tools (read-only server). |
+| `--version` | — | Print version and exit. |
 
 Flags override the environment, which supplies the defaults:
 
