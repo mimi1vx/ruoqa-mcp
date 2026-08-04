@@ -1,0 +1,101 @@
+name: release
+
+# release-plz creates the tag and GitHub Release with GITHUB_TOKEN, and GitHub
+# suppresses workflow triggers for events raised by GITHUB_TOKEN. So neither
+# `push: tags` nor `release: published` fires for an automated release — this
+# workflow has to be *called* by release-plz.yml instead. The `push: tags`
+# trigger is kept for hand-pushed tags; `workflow_dispatch` is the manual
+# retry path.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Tag to publish from.
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag to publish from, e.g. v0.1.2.
+        required: true
+        type: string
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write     # OIDC exchange — required
+      contents: read      # setting any permissions zeroes the rest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Empty on `push`, where checkout falls back to the pushed tag.
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # A retry, a hand-pushed tag racing the automated call, or GitHub's
+      # at-least-once push delivery can run this job twice for one version.
+      # crates.io rejects the loser with "already uploaded"/"already exists";
+      # treat that as a no-op instead of a failed run.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set +e
+          output=$(cargo publish 2>&1)
+          status=$?
+          echo "$output"
+          if [ $status -eq 0 ]; then
+            exit 0
+          fi
+          if echo "$output" | grep -qE 'already (uploaded|exists)'; then
+            echo "::notice::Version already published to crates.io; treating as no-op."
+            exit 0
+          fi
+          exit $status
+
+  # Not `needs: publish` — runs in parallel so a binary build failure can't
+  # block the registry publish, which is the release that actually matters.
+  binaries:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.ref || github.ref_name }}"
+          NAME="ruoqa-mcp-${TAG}-${{ matrix.target }}"
+          mkdir "$NAME"
+          strip target/release/ruoqa-mcp -o "$NAME/ruoqa-mcp"
+          cp README.md COPYING "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.ref || github.ref_name }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" --generate-notes || true
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber \
+            ruoqa-mcp-"${TAG}"-${{ matrix.target }}.tar.gz \
+            ruoqa-mcp-"${TAG}"-${{ matrix.target }}.tar.gz.sha256

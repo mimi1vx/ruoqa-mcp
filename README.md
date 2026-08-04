@@ -1,5 +1,7 @@
 # ruoqa-mcp
 
+[![CI](https://github.com/mimi1vx/ruoqa-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mimi1vx/ruoqa-mcp/actions/workflows/ci.yml)
+
 An [MCP](https://modelcontextprotocol.io) server that exposes curated,
 typed tools over the [openQA](https://open.qa) REST API. It is built on
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk) and the
@@ -9,6 +11,12 @@ Read tools work anonymously; mutating tools require API credentials and
 return `403` without them.
 
 ## Install
+
+```sh
+cargo install ruoqa-mcp
+```
+
+or from a checkout:
 
 ```sh
 cargo install --path .
