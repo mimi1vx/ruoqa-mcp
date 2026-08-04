@@ -69,6 +69,7 @@ async fn tick_forever<S: ProgressSink>(sink: &S, token: ProgressToken, interval:
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // edition 2024 requires unsafe for std::env::set_var
 mod tests {
     use std::sync::Mutex;
 

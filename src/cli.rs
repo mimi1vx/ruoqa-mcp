@@ -12,7 +12,7 @@ pub struct Cli {
     #[arg(long, conflicts_with = "stdio")]
     pub http: bool,
 
-    /// Serve over stdio (default; overrides OPENQA_MCP_TRANSPORT=http).
+    /// Serve over stdio (default; overrides `OPENQA_MCP_TRANSPORT=http`).
     #[arg(long)]
     pub stdio: bool,
 
@@ -24,7 +24,7 @@ pub struct Cli {
     #[arg(long, env = "OPENQA_MCP_PORT", default_value_t = 8000)]
     pub port: u16,
 
-    /// Disable all mutating tools (default: OPENQA_READONLY).
+    /// Disable all mutating tools (default: `OPENQA_READONLY`).
     #[arg(long)]
     pub readonly: bool,
 }
@@ -32,27 +32,30 @@ pub struct Cli {
 /// Interpret an environment variable as a boolean toggle. Deliberately not
 /// clap's `env` attribute on a bool flag: clap treats mere *presence* of the
 /// variable as true, but this must require a truthy value.
+#[must_use]
 pub fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| ["1", "true", "yes", "on"].contains(&v.trim().to_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_ok_and(|v| ["1", "true", "yes", "on"].contains(&v.trim().to_lowercase().as_str()))
 }
 
 impl Cli {
     /// Whether mutating tools should be disabled: the `--readonly` flag OR a
     /// truthy `OPENQA_READONLY`.
+    #[must_use]
     pub fn readonly(&self) -> bool {
         self.readonly || env_flag("OPENQA_READONLY")
     }
 
     /// Whether to serve over HTTP. An explicit `--stdio` wins; otherwise
     /// `--http` or `OPENQA_MCP_TRANSPORT=http` selects HTTP.
+    #[must_use]
     pub fn use_http(&self) -> bool {
         !self.stdio && (self.http || std::env::var("OPENQA_MCP_TRANSPORT").as_deref() == Ok("http"))
     }
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // edition 2024 requires unsafe for std::env::set_var
 mod tests {
     use super::*;
 

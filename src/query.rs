@@ -4,6 +4,7 @@
 use std::fmt::Display;
 
 /// Prefix a REST endpoint with the openQA API root.
+#[must_use]
 pub fn api(path: &str) -> String {
     format!("/api/v1/{path}")
 }
@@ -15,11 +16,13 @@ pub struct Query {
 }
 
 impl Query {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add `key=value` if `value` is `Some`; otherwise drop it.
+    #[must_use]
     pub fn push(mut self, key: &'static str, value: Option<impl Display>) -> Self {
         if let Some(v) = value {
             self.pairs.push((key, v.to_string()));
@@ -28,6 +31,7 @@ impl Query {
     }
 
     /// Add one `key=id` pair per element, mirroring httpx's list expansion.
+    #[must_use]
     pub fn push_all(mut self, key: &'static str, values: Option<&[i64]>) -> Self {
         if let Some(vs) = values {
             for v in vs {
@@ -38,6 +42,7 @@ impl Query {
     }
 
     /// Finish into `path`, or `path?a=b&...` if any pairs were pushed.
+    #[must_use]
     pub fn finish(self, path: &str) -> String {
         if self.pairs.is_empty() {
             return path.to_string();

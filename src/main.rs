@@ -5,6 +5,7 @@
 //! supplies the defaults.
 
 use std::io;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -88,7 +89,7 @@ async fn run_http(server: OpenQaServer, host: &str, port: u16) -> anyhow::Result
     let service: StreamableHttpService<OpenQaServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
-            Default::default(),
+            Arc::default(),
             StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
         );
     let router = axum::Router::new().nest_service("/mcp", service);

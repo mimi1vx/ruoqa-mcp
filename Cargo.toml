@@ -2,8 +2,14 @@
 name = "ruoqa-mcp"
 version = "0.1.0"
 edition = "2024"
-description = "MCP server exposing curated, typed tools over the openQA REST API"
+rust-version = "1.96"
 license = "GPL-3.0-or-later"
+description = "MCP server exposing curated, typed tools over the openQA REST API"
+repository = "https://github.com/mimi1vx/ruoqa-mcp"
+readme = "README.md"
+keywords = ["mcp", "openqa", "qa", "testing", "api"]
+categories = ["command-line-utilities", "api-bindings", "development-tools::testing"]
+exclude = ["/plans", "/.github"]
 
 [[bin]]
 name = "ruoqa-mcp"
@@ -36,3 +42,9 @@ anyhow = "1"
 wiremock = "0.6"
 tokio = { version = "1", features = ["test-util", "io-util"] }
 rmcp = { version = "3.1", features = ["client"] }
+
+[lints.rust]
+unsafe_code = "deny"   # ruoqa uses `forbid`; test modules need `env::set_var` (edition 2024)
+
+[lints.clippy]
+pedantic = "warn"

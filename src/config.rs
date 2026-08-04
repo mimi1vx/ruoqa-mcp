@@ -11,17 +11,22 @@ const TRUE_TOKENS: [&str; 3] = ["1", "true", "yes"];
 const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 /// Stand-in for "no timeout": httpx's `Timeout(None)` has no Rust equivalent
 /// here since `Timeouts::total` is a plain `Duration`, not `Option<Duration>`.
-const DISABLED_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 100);
+const DISABLED_TIMEOUT: Duration = Duration::from_hours(876_000);
 
 /// Map `OPENQA_VERIFY` to a [`TlsMode`]. Bool-ish tokens toggle verification;
 /// any other non-empty value is a path to a CA bundle. Unset/empty defaults
 /// to platform verification.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `raw` names a CA bundle path that cannot be
+/// read or parsed as PEM certificates.
 #[allow(
     clippy::result_large_err,
     reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
 )]
 pub fn parse_verify(raw: Option<&str>) -> Result<TlsMode> {
-    let token = raw.map(str::trim).unwrap_or("");
+    let token = raw.map_or("", str::trim);
     let lowered = token.to_lowercase();
     if FALSE_TOKENS.contains(&lowered.as_str()) {
         return Ok(TlsMode::danger_accept_invalid_certs());
@@ -42,10 +47,9 @@ pub fn parse_verify(raw: Option<&str>) -> Result<TlsMode> {
 pub fn parse_timeout(raw: Option<&str>) -> Timeouts {
     let default = Timeouts::default().total(Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS));
     match raw.map(str::parse::<f64>) {
-        None => default,
+        None | Some(Err(_)) => default,
         Some(Ok(v)) if v <= 0.0 => default.total(DISABLED_TIMEOUT),
         Some(Ok(v)) => default.total(Duration::from_secs_f64(v)),
-        Some(Err(_)) => default,
     }
 }
 
@@ -64,6 +68,7 @@ pub struct EnvConfig {
 }
 
 impl EnvConfig {
+    #[must_use]
     pub fn from_env() -> Self {
         Self {
             server: std::env::var("OPENQA_SERVER").ok(),
@@ -79,6 +84,11 @@ impl EnvConfig {
 /// Build a `ruoqa::Client` from `env`. `OPENQA_API_KEY`/`OPENQA_API_SECRET`
 /// only take effect when **both** are set, so the client is never
 /// half-configured; otherwise `client.conf` discovery applies.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if verify parsing or `ClientBuilder::build`
+/// fails.
 #[allow(
     clippy::result_large_err,
     reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
@@ -143,7 +153,7 @@ mod tests {
 
     #[test]
     fn timeout_from_value() {
-        assert_eq!(parse_timeout(Some("60")).total, Duration::from_secs(60));
+        assert_eq!(parse_timeout(Some("60")).total, Duration::from_mins(1));
     }
 
     #[test]

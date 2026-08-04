@@ -25,6 +25,7 @@ impl OpenQaServer {
     /// Merges the read router with the write router unless `readonly`, which
     /// keeps `--readonly` a compile-time-guaranteed subset rather than a
     /// hand-maintained list of mutating tool names to disable at runtime.
+    #[must_use]
     pub fn new(client: ruoqa::Client, readonly: bool) -> Self {
         let tool_router = if readonly {
             Self::read_tool_router()
@@ -74,6 +75,10 @@ pub(crate) fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as map_err(err), which requires a by-value fn"
+)]
 pub(crate) fn err(e: ruoqa::Error) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
 }
@@ -170,14 +175,20 @@ mod router_tests {
     #[test]
     fn read_router_matches_readme_table() {
         assert_eq!(READ_TOOL_NAMES.len(), 25);
-        let expected: BTreeSet<String> = READ_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        let expected: BTreeSet<String> = READ_TOOL_NAMES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         assert_eq!(names(&OpenQaServer::read_tool_router()), expected);
     }
 
     #[test]
     fn write_router_matches_readme_table() {
         assert_eq!(WRITE_TOOL_NAMES.len(), 15);
-        let expected: BTreeSet<String> = WRITE_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        let expected: BTreeSet<String> = WRITE_TOOL_NAMES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         assert_eq!(names(&OpenQaServer::write_tool_router()), expected);
     }
 

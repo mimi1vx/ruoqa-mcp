@@ -7,15 +7,18 @@ use std::fmt::Display;
 pub struct Form(Vec<(String, String)>);
 
 impl Form {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn push(mut self, key: &str, value: impl Display) -> Self {
         self.0.push((key.to_string(), value.to_string()));
         self
     }
 
+    #[must_use]
     pub fn push_opt(self, key: &str, value: Option<impl Display>) -> Self {
         match value {
             Some(v) => self.push(key, v),
@@ -23,6 +26,7 @@ impl Form {
         }
     }
 
+    #[must_use]
     pub fn push_all(mut self, key: &str, values: &[i64]) -> Self {
         for v in values {
             self.0.push((key.to_string(), v.to_string()));
@@ -30,6 +34,7 @@ impl Form {
         self
     }
 
+    #[must_use]
     pub fn pairs(&self) -> Vec<(&str, &str)> {
         self.0
             .iter()
