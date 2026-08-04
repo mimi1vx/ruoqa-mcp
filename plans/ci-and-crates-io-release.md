@@ -341,3 +341,41 @@ Do this only once Phase 2 is green on `main`, and **before** release-plz lands.
       "already published" notice.
 - [ ] `semver` job green after being added; a breaking change to a `pub` item in
       `src/lib.rs` turns it red.
+
+## Post-execution corrections
+
+All phases executed and every success criterion above verified live
+(0.1.0 hand-published, 0.1.1 released end-to-end through the automated
+path). Two details in this plan turned out to be wrong when exercised
+against real GitHub/crates.io behavior — noted here so a future re-read
+doesn't reintroduce the bugs:
+
+1. **The `release` environment must *not* restrict deployment
+   branches/tags.** Step 9 said to restrict to `v*`; doing so makes
+   GitHub reject the `release-plz.yml` → `uses: ./release.yml` call with
+   *"Branch main is not allowed to deploy to release"*, because
+   environment protection is evaluated against the **top-level**
+   triggering ref (`refs/heads/main`), not the tag passed via the
+   `ref:` input. `mimi1vx/ruoqa`'s actual `release` environment (checked
+   via the API) has `deployment_branch_policy: null` — no restriction at
+   all. Matched that here.
+2. **Trusted Publishing needs two entries, not one.** crates.io's OIDC
+   JWT carries the **top-level** workflow filename, same caveat as
+   above: a run triggered by `push:main` → `release-plz.yml` calling
+   `release.yml` presents `release-plz.yml` in the JWT, not
+   `release.yml`, and crates.io rejects a token request that doesn't
+   match a registered publisher. Registered two GitHub configs via
+   `POST /api/v1/trusted_publishing/github_configs` (crates.io API,
+   requires the bootstrap token — this predates deleting it), both
+   `environment: release`: one `workflow_filename: release.yml` (covers
+   `workflow_dispatch`/hand-pushed-tag runs) and one
+   `workflow_filename: release-plz.yml` (covers the automated path).
+   `mimi1vx/ruoqa` had not yet exercised its automated path at the time
+   of writing and would hit the same error.
+3. **Not in the plan at all:** the repo-level "Allow GitHub Actions to
+   create and approve pull requests" setting
+   (`can_approve_pull_request_reviews` via
+   `PUT /repos/{owner}/{repo}/actions/permissions/workflow`) defaults to
+   off on new repos and must be enabled, or `release-plz-pr`'s `gh pr
+   create` equivalent fails with a 403 regardless of the job's own
+   `pull-requests: write` permission.
