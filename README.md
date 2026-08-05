@@ -1,5 +1,8 @@
 # ruoqa-mcp
 
+<img src="https://raw.githubusercontent.com/mimi1vx/ruoqa-mcp/main/docs/assets/logo.svg"
+     align="right" width="130" alt="ruoqa-mcp logo">
+
 [![CI](https://github.com/mimi1vx/ruoqa-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mimi1vx/ruoqa-mcp/actions/workflows/ci.yml)
 
 An [MCP](https://modelcontextprotocol.io) server that exposes curated,

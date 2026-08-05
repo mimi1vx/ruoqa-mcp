@@ -1,0 +1,14 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+<rect width="1280" height="640" fill="#081E26"/>
+<rect x="110" y="140" width="360" height="360" rx="56" fill="#FFFFFF"/>
+<g transform="translate(140,170) scale(0.1465)">
+<path fill="#FFFFFF" d="M 0 0 L 2048 0 L 2048 2048 L 0 2048 L 0 0 z"/>
+<rect x="272" y="272" width="1504" height="1504" rx="336" fill="#081E26"/>
+<circle cx="1024" cy="1000" r="404" fill="none" stroke="#FFFFFF" stroke-width="134" stroke-linecap="round" stroke-dasharray="609.2 236.9" transform="rotate(-58.2 1024 1000)"/>
+<path d="M 1146 1122 L 1400 1376 L 1560 1376" fill="none" stroke="#88B531" stroke-width="134" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="545" y="330" font-family="Adwaita Mono, monospace" font-weight="700" font-size="96"><tspan fill="#88B531">$ </tspan><tspan fill="#FFFFFF">ruoqa-mcp</tspan></text>
+<text x="545" y="400" font-family="Adwaita Sans, Cantarell, sans-serif" font-size="34" fill="#C7D6DB">MCP server for the openQA REST API</text>
+<text x="545" y="452" font-family="Adwaita Sans, Cantarell, sans-serif" font-size="27" fill="#88B531">Typed tools &#183; anonymous reads &#183; rmcp + Rust</text>
+</svg>
