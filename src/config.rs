@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use reqwest::Certificate;
-use ruoqa::{ApiKey, ApiSecret, Client, ClientBuilder, Error, Result, Timeouts, TlsMode};
+use ruoqa::{Client, ClientBuilder, Error, Result, Timeouts, TlsMode};
 
 const FALSE_TOKENS: [&str; 3] = ["0", "false", "no"];
 const TRUE_TOKENS: [&str; 3] = ["1", "true", "yes"];
@@ -57,8 +57,6 @@ pub fn parse_timeout(raw: Option<&str>) -> Timeouts {
 /// parsing logic stays pure and testable without mutating `std::env`.
 pub struct EnvConfig {
     pub server: Option<String>,
-    pub api_key: Option<String>,
-    pub api_secret: Option<String>,
     pub verify: Option<String>,
     pub timeout: Option<String>,
     /// Override for `ClientBuilder::config_paths`. `None` (the production
@@ -72,8 +70,6 @@ impl EnvConfig {
     pub fn from_env() -> Self {
         Self {
             server: std::env::var("OPENQA_SERVER").ok(),
-            api_key: std::env::var("OPENQA_API_KEY").ok(),
-            api_secret: std::env::var("OPENQA_API_SECRET").ok(),
             verify: std::env::var("OPENQA_VERIFY").ok(),
             timeout: std::env::var("OPENQA_MCP_TIMEOUT").ok(),
             config_paths: None,
@@ -81,14 +77,16 @@ impl EnvConfig {
     }
 }
 
-/// Build a `ruoqa::Client` from `env`. `OPENQA_API_KEY`/`OPENQA_API_SECRET`
-/// only take effect when **both** are set, so the client is never
-/// half-configured; otherwise `client.conf` discovery applies.
+/// Build a `ruoqa::Client` from `env`. Credentials are resolved by
+/// `ClientBuilder::build` itself, in order: builder-supplied, then the
+/// process environment, then `client.conf` discovery.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] if verify parsing or `ClientBuilder::build`
-/// fails.
+/// Returns [`Error::Config`] if verify parsing fails, or propagates
+/// `ClientBuilder::build`'s errors, including
+/// [`Error::IncompleteCredentials`] when the environment sets only one
+/// half of a credential pair.
 #[allow(
     clippy::result_large_err,
     reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
@@ -100,11 +98,6 @@ pub fn build_client(env: &EnvConfig) -> Result<Client> {
         .server(env.server.clone().unwrap_or_default())
         .tls(tls)
         .timeouts(timeouts);
-    if let (Some(key), Some(secret)) = (&env.api_key, &env.api_secret) {
-        builder = builder
-            .api_key(ApiKey::new(key.as_str()))
-            .api_secret(ApiSecret::new(secret.as_str()));
-    }
     if let Some(paths) = env.config_paths.clone() {
         builder = builder.config_paths(paths);
     }
@@ -168,17 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn lone_api_key_is_ignored() {
+    fn build_client_uses_configured_server() {
         let env = EnvConfig {
             server: Some("openqa.example.com".to_string()),
-            api_key: Some("DEADBEEF".to_string()),
-            api_secret: None,
             verify: None,
             timeout: None,
             config_paths: Some(vec![]), // never touch the developer's real client.conf
         };
         let client = build_client(&env).unwrap();
-        // A lone OPENQA_API_KEY must not reach the client's credentials.
-        assert!(format!("{client:?}").contains("api_key: None"));
+        assert_eq!(client.base_url().host_str(), Some("openqa.example.com"));
     }
 }

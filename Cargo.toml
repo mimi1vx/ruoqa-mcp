@@ -1,6 +1,6 @@
 [package]
 name = "ruoqa-mcp"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "GPL-3.0-or-later"
@@ -24,7 +24,7 @@ rmcp = { version = "3.1", features = [
     "server", "macros", "schemars",
     "transport-io", "transport-streamable-http-server",
 ] }
-ruoqa = "0.1.2"
+ruoqa = "0.2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

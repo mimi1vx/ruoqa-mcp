@@ -42,13 +42,13 @@ to the openQA client config file for credentials.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENQA_SERVER` | *(unset)* | openQA host (e.g. `openqa.opensuse.org`). Empty falls back to ruoqa's `client.conf` discovery. |
-| `OPENQA_API_KEY` | *(unset)* | API key; overrides the config file when set. |
-| `OPENQA_API_SECRET` | *(unset)* | API secret; overrides the config file when set. |
+| `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. |
+| `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. |
 
-`OPENQA_API_KEY` and `OPENQA_API_SECRET` only take effect when **both** are
-set; a partial pair is ignored so the client is never half-configured.
+`OPENQA_API_KEY` and `OPENQA_API_SECRET` must both be set together; setting
+only one is a startup error.
 
 `OPENQA_VERIFY` set to a path loads that file as the **only** trusted CA
 bundle (it replaces the platform trust store rather than merging with it),
@@ -57,20 +57,23 @@ a custom CA with the platform roots, this is stricter than before.
 
 ### Config file
 
-If the env credentials are not set, ruoqa loads them from
-`~/.config/openqa/client.conf` (or `/etc/openqa/client.conf`). Generate a
-key/secret from the *API keys* page of your openQA instance and add a section
-keyed by the host:
+If the env credentials are not set, ruoqa falls back to a tiered
+`client.conf` lookup: `$OPENQA_CONFIG` first, then
+`$XDG_CONFIG_HOME/openqa` (or `~/.config/openqa` if that's unset), then
+`/etc/openqa` and `/usr/etc/openqa`. The first tier that has any file (a
+`client.conf` and/or `client.conf.d/*.conf` drop-ins) wins outright — a user
+config *replaces* `/etc/openqa/client.conf` rather than merging with it. An
+empty tier (no files at all) falls through to the next one, so an unset or
+empty `$OPENQA_CONFIG` directory does not exclude `/etc`.
+
+Generate a key/secret from the *API keys* page of your openQA instance and
+add a section keyed by the host:
 
 ```ini
 [openqa.opensuse.org]
 key = YOUR_API_KEY
 secret = YOUR_API_SECRET
 ```
-
-Set `$OPENQA_CONFIG` to a directory to override the search path entirely
-(ruoqa then looks *only* at `$OPENQA_CONFIG/client.conf`) — an override
-openQA's own Python client does not have.
 
 Without any credentials the server is GET-only (read tools succeed, mutating
 tools get `403`).
