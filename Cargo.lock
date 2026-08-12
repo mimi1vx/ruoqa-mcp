@@ -1575,6 +1575,7 @@ dependencies = [
  "axum",
  "clap",
  "form_urlencoded",
+ "percent-encoding",
  "reqwest",
  "rmcp",
  "ruoqa",

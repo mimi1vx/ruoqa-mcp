@@ -339,6 +339,99 @@ async fn cancel_jobs_drops_blank_filter_alongside_a_real_one() {
 }
 
 #[tokio::test]
+async fn cancel_scheduled_product_valid_name_produces_expected_path() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    call(
+        &client,
+        "cancel_scheduled_product",
+        json!({"name": "SLE-15-SP4-Online-x86_64-Build1.1-Media1.iso"}),
+    )
+    .await
+    .expect("call_tool");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let request = requests.last().expect("one request");
+    assert_eq!(
+        request.url.path(),
+        "/api/v1/isos/SLE-15-SP4-Online-x86_64-Build1.1-Media1.iso/cancel"
+    );
+}
+
+#[tokio::test]
+async fn cancel_scheduled_product_cannot_escape_the_isos_segment() {
+    let cases = ["../jobs/7", "/", "%2f", "x?foo=bar", "x#frag", "ünïcode"];
+
+    for name in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
+            .mount(&mock)
+            .await;
+        let client = server_with_mock(&mock, false).await;
+
+        call(&client, "cancel_scheduled_product", json!({"name": name}))
+            .await
+            .unwrap_or_else(|e| panic!("cancel_scheduled_product with {name:?} failed: {e}"));
+
+        let requests = mock.received_requests().await.expect("recorded requests");
+        let request = requests.last().expect("one request");
+        let path = request.url.path();
+        assert!(
+            path.starts_with("/api/v1/isos/") && path.ends_with("/cancel"),
+            "name {name:?}: path {path} escaped the isos/.../cancel shape"
+        );
+        let segment = &path["/api/v1/isos/".len()..path.len() - "/cancel".len()];
+        assert!(
+            !segment.contains('/'),
+            "name {name:?}: segment {segment:?} contains an extra path separator"
+        );
+        assert_eq!(
+            request.url.query(),
+            None,
+            "name {name:?}: request must carry no query string"
+        );
+        assert_ne!(
+            path, "/api/v1/jobs/7/cancel",
+            "name {name:?}: leaked into the jobs cancel endpoint"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancel_scheduled_product_rejects_empty_and_dot_names() {
+    for name in ["", ".", ".."] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
+            .mount(&mock)
+            .await;
+        let client = server_with_mock(&mock, false).await;
+
+        let err = call(&client, "cancel_scheduled_product", json!({"name": name}))
+            .await
+            .expect_err(&format!("name {name:?} must be rejected"));
+
+        let rmcp::ServiceError::McpError(mcp_err) = err else {
+            panic!("expected McpError, got {err:?}");
+        };
+        assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            mock.received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "name {name:?} must send no HTTP request"
+        );
+    }
+}
+
+#[tokio::test]
 async fn readonly_server_does_not_expose_mutating_tools() {
     let mock = MockServer::start().await;
     let client = server_with_mock(&mock, true).await;

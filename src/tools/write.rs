@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Method;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -131,6 +132,27 @@ pub struct CancelScheduledProduct {
 /// Blank-after-trim values are not filters: treat them the same as absent.
 fn nonblank(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
+}
+
+/// Encode set = complement of RFC 3986 unreserved (`A-Za-z0-9` plus `-._~`).
+const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode `value` into exactly one path segment. `.` and `..` are
+/// rejected outright rather than encoded: the `url` crate resolves their
+/// percent-encoded forms (`%2e`, `%2e%2e`, ...) back to dot segments too, so
+/// encoding alone would not close the traversal.
+fn path_segment(value: &str) -> Result<String, ErrorData> {
+    if value.is_empty() || value == "." || value == ".." {
+        return Err(ErrorData::invalid_params(
+            "name must not be empty, \".\", or \"..\"",
+            None,
+        ));
+    }
+    Ok(utf8_percent_encode(value, SEGMENT).to_string())
 }
 
 #[tool_router(router = write_tool_router, vis = "pub(crate)")]
@@ -473,9 +495,51 @@ impl OpenQaServer {
         Parameters(CancelScheduledProduct { name }): Parameters<CancelScheduledProduct>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let name = path_segment(&name)?;
         to_result(
             self.request_json(&ctx, Method::POST, &api(&format!("isos/{name}/cancel")))
                 .await,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_iso_name_passes_through_unchanged() {
+        assert_eq!(
+            path_segment("SLE-15-SP4-Online-x86_64-Build1.1-Media1.iso").unwrap(),
+            "SLE-15-SP4-Online-x86_64-Build1.1-Media1.iso"
+        );
+    }
+
+    #[test]
+    fn slash_is_encoded() {
+        assert_eq!(path_segment("../jobs/7").unwrap(), "..%2Fjobs%2F7");
+    }
+
+    #[test]
+    fn percent_is_encoded() {
+        assert_eq!(path_segment("%2f").unwrap(), "%252f");
+    }
+
+    #[test]
+    fn query_and_fragment_markers_are_encoded() {
+        assert_eq!(path_segment("x?foo=bar").unwrap(), "x%3Ffoo%3Dbar");
+        assert_eq!(path_segment("x#frag").unwrap(), "x%23frag");
+    }
+
+    #[test]
+    fn non_ascii_is_utf8_percent_escaped() {
+        assert_eq!(path_segment("ünïcode").unwrap(), "%C3%BCn%C3%AFcode");
+    }
+
+    #[test]
+    fn empty_and_dot_segments_are_rejected() {
+        assert!(path_segment("").is_err());
+        assert!(path_segment(".").is_err());
+        assert!(path_segment("..").is_err());
     }
 }
