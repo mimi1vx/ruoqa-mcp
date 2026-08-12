@@ -128,6 +128,11 @@ pub struct CancelScheduledProduct {
     pub name: String,
 }
 
+/// Blank-after-trim values are not filters: treat them the same as absent.
+fn nonblank(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
 #[tool_router(router = write_tool_router, vis = "pub(crate)")]
 impl OpenQaServer {
     #[tool(
@@ -314,7 +319,7 @@ impl OpenQaServer {
     }
 
     #[tool(
-        description = "Cancel all jobs matching the given filters.",
+        description = "Cancel jobs matching the given filters; at least one filter is required.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn cancel_jobs(
@@ -322,19 +327,28 @@ impl OpenQaServer {
         Parameters(args): Parameters<CancelJobs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = Query::new()
-            .push("state", args.state)
-            .push("result", args.result)
-            .push("distri", args.distri)
-            .push("version", args.version)
-            .push("build", args.build)
-            .push("test", args.test)
-            .push("arch", args.arch)
-            .push("machine", args.machine)
+        let query = Query::new()
+            .push("state", nonblank(args.state))
+            .push("result", nonblank(args.result))
+            .push("distri", nonblank(args.distri))
+            .push("version", nonblank(args.version))
+            .push("build", nonblank(args.build))
+            .push("test", nonblank(args.test))
+            .push("arch", nonblank(args.arch))
+            .push("machine", nonblank(args.machine))
             .push("groupid", args.groupid)
-            .push("group", args.group)
-            .finish(&api("jobs/cancel"));
-        to_result(self.request_json(&ctx, Method::POST, &path).await)
+            .push("group", nonblank(args.group));
+        if query.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "cancel_jobs requires at least one filter (state, result, distri, version, \
+                 build, test, arch, machine, groupid, or group)",
+                None,
+            ));
+        }
+        to_result(
+            self.request_json(&ctx, Method::POST, &query.finish(&api("jobs/cancel")))
+                .await,
+        )
     }
 
     #[tool(

@@ -41,6 +41,12 @@ impl Query {
         self
     }
 
+    /// True if no pairs survived `push`/`push_all` (all inputs were `None`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
     /// Finish into `path`, or `path?a=b&...` if any pairs were pushed.
     #[must_use]
     pub fn finish(self, path: &str) -> String {
@@ -72,6 +78,17 @@ mod tests {
         let ids = [1, 2];
         let q = Query::new().push_all("ids", Some(&ids));
         assert_eq!(q.finish("/api/v1/jobs"), "/api/v1/jobs?ids=1&ids=2");
+    }
+
+    #[test]
+    fn is_empty_true_only_when_no_pairs_pushed() {
+        let q = Query::new()
+            .push("state", None::<&str>)
+            .push_all("ids", None);
+        assert!(q.is_empty());
+
+        let q = Query::new().push("state", Some("done"));
+        assert!(!q.is_empty());
     }
 
     #[test]
