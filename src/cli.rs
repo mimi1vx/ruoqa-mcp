@@ -7,6 +7,10 @@ use clap::Parser;
 /// Run the openQA MCP server over stdio (default) or HTTP.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ruoqa-mcp", version)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a CLI is a flat bag of flags, not a state machine"
+)]
 pub struct Cli {
     /// Serve over HTTP instead of stdio.
     #[arg(long, conflicts_with = "stdio")]
@@ -27,6 +31,26 @@ pub struct Cli {
     /// Disable all mutating tools (default: `OPENQA_READONLY`).
     #[arg(long)]
     pub readonly: bool,
+
+    /// Serve HTTP without authentication. Only for a trusted, isolated
+    /// network: every caller gets the full write scope.
+    ///
+    /// Tokens are never taken from the command line (argv is world-readable);
+    /// set `OPENQA_MCP_HTTP_TOKEN`/`OPENQA_MCP_HTTP_READ_TOKEN` in the
+    /// environment or in `~/.env` instead.
+    #[arg(long)]
+    pub insecure_no_auth: bool,
+
+    /// Public authority accepted in the `Host` header, e.g.
+    /// `mcp.example.com` or `mcp.example.com:8000`. Repeatable; loopback
+    /// names are always accepted.
+    #[arg(
+        long = "allowed-host",
+        value_name = "HOST",
+        env = "OPENQA_MCP_ALLOWED_HOSTS",
+        value_delimiter = ','
+    )]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Interpret an environment variable as a boolean toggle. Deliberately not
@@ -71,6 +95,22 @@ mod tests {
         assert_eq!(cli.port, 8000);
         assert!(!cli.readonly());
         assert!(!cli.use_http());
+        assert!(!cli.insecure_no_auth);
+        assert!(cli.allowed_hosts.is_empty());
+
+        let cli = Cli::parse_from([
+            "ruoqa-mcp",
+            "--insecure-no-auth",
+            "--allowed-host",
+            "mcp.example.com",
+            "--allowed-host",
+            "mcp2.example.com:8000",
+        ]);
+        assert!(cli.insecure_no_auth);
+        assert_eq!(
+            cli.allowed_hosts,
+            ["mcp.example.com", "mcp2.example.com:8000"]
+        );
 
         let cli = Cli::parse_from(["ruoqa-mcp", "--server", "0.0.0.0", "--port", "9001"]);
         assert_eq!(cli.host, "0.0.0.0");
@@ -117,6 +157,18 @@ mod tests {
             );
         }
         unsafe { std::env::remove_var("OPENQA_READONLY") };
+
+        unsafe {
+            std::env::set_var(
+                "OPENQA_MCP_ALLOWED_HOSTS",
+                "a.example.com,b.example.com:9000",
+            );
+        }
+        assert_eq!(
+            Cli::parse_from(["ruoqa-mcp"]).allowed_hosts,
+            ["a.example.com", "b.example.com:9000"]
+        );
+        unsafe { std::env::remove_var("OPENQA_MCP_ALLOWED_HOSTS") };
 
         unsafe { std::env::set_var("OPENQA_MCP_TRANSPORT", "http") };
         assert!(Cli::parse_from(["ruoqa-mcp"]).use_http());

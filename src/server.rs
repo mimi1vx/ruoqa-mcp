@@ -3,22 +3,33 @@
 
 use reqwest::Method;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ResultType, ServerCapabilities, ServerInfo, Tool,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
+use crate::http::{Scope, scope_of};
 
 const INSTRUCTIONS: &str = "Query and control an openQA instance. Read tools inspect jobs, \
 machines, test suites, and products; mutating tools restart/cancel/delete jobs, comment, and \
 trigger ISOs, and require API credentials.";
 
+/// Denial text for both refusal paths. Deliberately identical and detail-free:
+/// a caller learns that it may not do this, not how the gate is wired.
+const DENIED: &str = "this credential is not authorized for mutating tools";
+
 #[derive(Clone)]
 pub struct OpenQaServer {
     pub(crate) client: ruoqa::Client,
     tool_router: ToolRouter<Self>,
+    /// Whether each request must carry a [`Scope`]. Off for stdio, where the
+    /// process credential is the only principal there is.
+    enforce_scopes: bool,
 }
 
 impl OpenQaServer {
@@ -35,6 +46,29 @@ impl OpenQaServer {
         Self {
             client,
             tool_router,
+            enforce_scopes: false,
+        }
+    }
+
+    /// Require every request to carry a [`Scope`] and refuse mutating tools to
+    /// read-scope principals. Enabled for authenticated HTTP only.
+    #[must_use]
+    pub fn with_scope_enforcement(mut self, yes: bool) -> Self {
+        self.enforce_scopes = yes;
+        self
+    }
+
+    /// Fail-closed authorization for one tool call.
+    fn authorize(&self, name: &str, context: &RequestContext<RoleServer>) -> Result<(), ErrorData> {
+        if !self.enforce_scopes {
+            return Ok(());
+        }
+        match scope_of(context) {
+            Some(Scope::Write) => Ok(()),
+            Some(Scope::Read) if self.tool_router.get(name).is_some_and(is_read_only) => Ok(()),
+            // No scope means the auth middleware did not run: deny rather than
+            // assume the transport was configured the way we expect.
+            Some(Scope::Read) | None => Err(ErrorData::invalid_request(DENIED, None)),
         }
     }
 
@@ -87,11 +121,60 @@ pub(crate) fn to_result(result: ruoqa::Result<Value>) -> Result<CallToolResult, 
     result.map_err(err).and_then(ok)
 }
 
+/// A tool is non-mutating only if it says so itself. Derived from the
+/// annotation rather than a name list so a tool added later cannot slip past
+/// the gate by being forgotten.
+fn is_read_only(tool: &Tool) -> bool {
+    tool.annotations
+        .as_ref()
+        .is_some_and(|a| a.read_only_hint == Some(true))
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OpenQaServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
+    }
+
+    /// The macro's body, gated on the caller's scope.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.authorize(&request.name, &context)?;
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    /// The macro's body, minus the tools this principal could not call anyway.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        if self.enforce_scopes {
+            match scope_of(&context) {
+                Some(Scope::Write) => {}
+                Some(Scope::Read) => tools.retain(is_read_only),
+                None => return Err(ErrorData::invalid_request(DENIED, None)),
+            }
+        }
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            // Tool visibility depends on the caller's scope, so a shared cache
+            // would hand a read principal the write list.
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+        })
     }
 }
 
@@ -196,5 +279,25 @@ mod router_tests {
     fn readonly_excludes_write_tools() {
         let full = OpenQaServer::read_tool_router() + OpenQaServer::write_tool_router();
         assert_eq!(full.list_all().len(), 40);
+    }
+
+    // The scope gate reads `read_only_hint`, so an unannotated (or inverted)
+    // tool would silently become callable by a read-scope principal.
+    #[test]
+    fn annotations_agree_with_the_routers() {
+        for tool in OpenQaServer::read_tool_router().list_all() {
+            assert!(
+                is_read_only(&tool),
+                "{} must be read_only_hint=true",
+                tool.name
+            );
+        }
+        for tool in OpenQaServer::write_tool_router().list_all() {
+            assert!(
+                !is_read_only(&tool),
+                "{} must not be read_only_hint=true",
+                tool.name
+            );
+        }
     }
 }

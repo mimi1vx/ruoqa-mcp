@@ -55,6 +55,27 @@ bundle (it replaces the platform trust store rather than merging with it),
 matching httpx's `verify=<path>` semantics. If a deployment relies on merging
 a custom CA with the platform roots, this is stricter than before.
 
+### `~/.env`
+
+Keeping a long-running server's configuration in a shell profile is awkward, so
+**every** variable in this README — the ones above, the HTTP ones below, and
+`RUST_LOG` — may instead live in `~/.env`, read once at startup:
+
+```sh
+umask 077
+cat >> ~/.env <<'EOF'
+# comments and blank lines are ignored
+OPENQA_SERVER=openqa.opensuse.org
+OPENQA_MCP_HTTP_TOKEN="a-token-may-be-quoted"
+EOF
+```
+
+A variable that is already exported always wins over the file, so `~/.env`
+supplies defaults rather than overrides. Only this fixed path is read — never a
+`.env` in the working directory, because a daemon must not pick up credentials
+from wherever it happened to be started. A missing or unreadable `~/.env` is not
+an error. The file usually holds secrets, so keep it mode `0600`.
+
 ### Config file
 
 If the env credentials are not set, ruoqa falls back to a tiered
@@ -187,13 +208,76 @@ Example MCP client configuration:
 
 ### HTTP (optional)
 
-For remote or shared deployments, run over HTTP with `--http`:
+For remote or shared deployments, run over HTTP with `--http`. HTTP callers
+authenticate with a bearer token, so generate one first:
 
 ```sh
+export OPENQA_MCP_HTTP_TOKEN=$(openssl rand -hex 32)
 ruoqa-mcp --http --server 127.0.0.1 --port 8000
 ```
 
-The MCP endpoint is mounted at `/mcp`.
+The MCP endpoint is mounted at `/mcp`; clients send
+`Authorization: Bearer <token>` with every request.
+
+#### Authentication and scopes
+
+Unlike stdio — where the client already owns the process — HTTP exposes the
+server's single openQA credential to anyone who can reach the port, so
+authentication is mandatory and deny-by-default. Two tokens define two scopes:
+
+| Token | Scope | Tools |
+| --- | --- | --- |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 40 read + mutating tools |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 25 read tools only |
+
+Either may be set alone. A read-scope caller sees only the read tools in
+`tools/list` and gets an MCP error — with no openQA request made — if it calls a
+mutating tool anyway; the split is derived from each tool's `readOnlyHint`
+annotation, so it cannot drift from the tool registry. Because the advertised
+tool set depends on the credential, a client that caches `tools/list` across
+tokens will show a stale list.
+
+Tokens are never accepted as command-line flags: argv is world-readable via
+`ps`. Like every other variable, they may come from [`~/.env`](#env) instead of
+the environment:
+
+```sh
+umask 077
+printf 'OPENQA_MCP_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.env
+```
+
+The server refuses to start (before binding the port) when:
+
+- `--http` is given with no token and no `--insecure-no-auth`;
+- `--insecure-no-auth` is combined with a token;
+- a token is shorter than 32 characters, or contains anything but printable
+  non-space ASCII;
+- the read token equals the write token;
+- the `--allowed-host` flag is given without `--http` (the same value from the
+  environment or `~/.env` is simply ignored by a stdio run).
+
+Tokens set while running over stdio are ignored.
+
+> **The transport is plaintext HTTP.** A bearer token sent over it is readable
+> by anything on the path, so never expose the port beyond a trusted network
+> without terminating TLS in front of it (reverse proxy, service mesh, or an
+> SSH tunnel).
+>
+> Static bearer tokens are not MCP's OAuth 2.1 authorization flow. Clients that
+> only implement the spec's `401` → resource-metadata → OAuth dance will not
+> authenticate; use a client that lets you set a header.
+
+#### `Host` allowlist
+
+To block DNS rebinding, requests are accepted only for a known authority:
+`localhost`, `127.0.0.1` and `::1` always, plus every `--allowed-host` value.
+Anything else gets `403`. Name the public authority explicitly when the server
+is not reached over loopback — the bind address is deliberately not treated as
+an identity, so binding `0.0.0.0` allows nothing extra:
+
+```sh
+ruoqa-mcp --http --server 0.0.0.0 --allowed-host mcp.example.com:8000
+```
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
@@ -201,18 +285,29 @@ The MCP endpoint is mounted at `/mcp`.
 | `--stdio` | on | Serve over stdio; overrides `OPENQA_MCP_TRANSPORT=http`. |
 | `--server` | `127.0.0.1` | HTTP bind host. |
 | `--port` | `8000` | HTTP bind port. |
+| `--allowed-host` | *(none)* | Extra authority accepted in the `Host` header; repeatable. |
+| `--insecure-no-auth` | off | Serve HTTP with no authentication at all; prints a warning on start. |
 | `--readonly` | off | Unregister all mutating tools (read-only server). |
 | `--version` | — | Print version and exit. |
 
-Flags override the environment, which supplies the defaults:
+Flags override the environment, which supplies the defaults (and which
+`~/.env` in turn supplies defaults for):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENQA_MCP_TRANSPORT` | `stdio` | Set to `http` to serve over HTTP. |
 | `OPENQA_MCP_HOST` | `127.0.0.1` | Default HTTP bind host. |
 | `OPENQA_MCP_PORT` | `8000` | Default HTTP bind port. |
+| `OPENQA_MCP_HTTP_TOKEN` | *(unset)* | Bearer token granting the write scope. |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | *(unset)* | Bearer token granting the read scope. |
+| `OPENQA_MCP_ALLOWED_HOSTS` | *(unset)* | Comma-separated default for `--allowed-host`. |
 | `OPENQA_READONLY` | `false` | Set truthy (`1`/`true`/`yes`/`on`) to disable mutating tools. |
 | `OPENQA_MCP_HEARTBEAT_INTERVAL` | `15.0` | Seconds between progress "heartbeat" pings sent while a tool waits on a slow openQA call, so MCP clients see liveness instead of timing out. Set `<=0` to disable. Pings are a no-op unless the client sent a `progressToken`. |
+
+`--readonly` and the read token are different levers: `--readonly` is
+process-wide and unregisters the mutating tools for every caller, including
+stdio; the read token restricts one HTTP principal while others keep write
+access.
 
 Press `Ctrl-C` to stop; the server shuts down cleanly on both transports.
 
