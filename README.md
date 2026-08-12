@@ -147,7 +147,7 @@ a temporary file and process it with `jq`, e.g.
 | `duplicate_job` | Duplicate (clone) a job. |
 | `set_job_priority` | Set the priority of a job. |
 | `restart_jobs_bulk` | Restart several jobs in one bulk request. |
-| `cancel_jobs` | Cancel all jobs matching the given filters. |
+| `cancel_jobs` | Cancel jobs matching the given filters; at least one filter is required. |
 | `add_group_comment` | Add a comment to a job group. |
 | `add_parent_group_comment` | Add a comment to a parent job group. |
 | `update_job_comment` | Update an existing job comment. |

@@ -224,6 +224,121 @@ async fn unauthenticated_write_403_becomes_error_without_secret() {
 }
 
 #[tokio::test]
+async fn cancel_jobs_empty_filter_is_rejected() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(&client, "cancel_jobs", json!({}))
+        .await
+        .expect_err("empty filter must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancel_jobs_blank_only_filter_is_rejected() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(&client, "cancel_jobs", json!({"state": "   "}))
+        .await
+        .expect_err("blank-only filter must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancel_jobs_each_filter_alone_produces_expected_query() {
+    let cases: [(&str, Value, &str); 10] = [
+        ("state", json!("running"), "state=running"),
+        ("result", json!("failed"), "result=failed"),
+        ("distri", json!("opensuse"), "distri=opensuse"),
+        ("version", json!("15.5"), "version=15.5"),
+        ("build", json!("42"), "build=42"),
+        ("test", json!("boot"), "test=boot"),
+        ("arch", json!("x86_64"), "arch=x86_64"),
+        ("machine", json!("64bit"), "machine=64bit"),
+        ("groupid", json!(7), "groupid=7"),
+        ("group", json!("staging"), "group=staging"),
+    ];
+
+    for (key, value, expected_query) in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/jobs/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+            .mount(&mock)
+            .await;
+        let client = server_with_mock(&mock, false).await;
+
+        let mut args = serde_json::Map::new();
+        args.insert(key.to_string(), value);
+        call(&client, "cancel_jobs", Value::Object(args))
+            .await
+            .unwrap_or_else(|e| panic!("cancel_jobs with {key} failed: {e}"));
+
+        let requests = mock.received_requests().await.expect("recorded requests");
+        let request = requests.last().expect("one request");
+        assert_eq!(
+            request.url.query().unwrap_or(""),
+            expected_query,
+            "filter: {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancel_jobs_drops_blank_filter_alongside_a_real_one() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    call(
+        &client,
+        "cancel_jobs",
+        json!({"state": "running", "arch": "  "}),
+    )
+    .await
+    .expect("call_tool");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let request = requests.last().expect("one request");
+    assert_eq!(request.url.query().unwrap_or(""), "state=running");
+}
+
+#[tokio::test]
 async fn readonly_server_does_not_expose_mutating_tools() {
     let mock = MockServer::start().await;
     let client = server_with_mock(&mock, true).await;
