@@ -1,8 +1,9 @@
 //! Command-line entry point for the openQA MCP server (port of `__main__.py`).
 //!
-//! Selects the transport and, for HTTP, the bind address. Flags override the
-//! environment; the environment (`OPENQA_MCP_TRANSPORT`/`HOST`/`PORT`)
-//! supplies the defaults.
+//! Selects the transport and, for HTTP, the bind address and credentials.
+//! Flags override the environment; the environment
+//! (`OPENQA_MCP_TRANSPORT`/`HOST`/`PORT`) supplies the defaults, and `~/.env`
+//! supplies defaults for the environment.
 
 use std::io;
 use std::sync::Arc;
@@ -10,30 +11,30 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use rmcp::ServiceExt;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
-use rmcp::transport::{StreamableHttpServerConfig, stdio};
+use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
+use ruoqa_mcp::http::{AuthConfigError, HttpAuth, HttpEnv, allowed_hosts, router};
 use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer, build_client};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Logging must go to stderr: anything on stdout corrupts the stdio JSON-RPC stream.
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+fn main() -> anyhow::Result<()> {
+    // Before the runtime, and therefore before any other thread exists.
+    load_home_env();
 
-    let cli = Cli::parse();
-    let result = run(cli).await;
+    // Not `#[tokio::main]`: the runtime must be built *after* the environment
+    // is populated, so that `set_var` above is provably single-threaded.
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the tokio runtime")?
+        .block_on(serve());
 
     // `rmcp::transport::stdio()` reads the real stdin fd on a blocking-pool
     // thread; if the peer never closes its end (e.g. it was killed rather
     // than exiting), that thread stays parked in `read()` forever, and the
-    // `Runtime` this macro builds would hang on drop waiting for it. Exit
-    // directly instead of returning through `main` so a still-open stdin
-    // never turns a clean Ctrl-C into a hang.
+    // `Runtime` would hang on drop waiting for it. Exit directly instead of
+    // returning through `main` so a still-open stdin never turns a clean
+    // Ctrl-C into a hang.
     match result {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -43,14 +44,62 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Fold `~/.env` into the environment so every variable this server reads —
+/// including the ones consumed inside `clap`, `ruoqa` and `tracing`, which no
+/// call site of ours can intercept — can be configured there. A variable that
+/// is already set always wins.
+#[allow(
+    unsafe_code,
+    reason = "the only sound place to call set_var: main's first statement"
+)]
+fn load_home_env() {
+    for (key, value) in ruoqa_mcp::dotenv::read_home_env() {
+        if std::env::var_os(&key).is_none() {
+            // SAFETY: this runs as the first statement of `main`, before the
+            // tokio runtime is built and before anything else spawns a thread,
+            // so no concurrent environment access is possible.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
+
+async fn serve() -> anyhow::Result<()> {
+    // Logging must go to stderr: anything on stdout corrupts the stdio JSON-RPC stream.
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    run(Cli::parse()).await
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let readonly = cli.readonly();
+    let http_env = HttpEnv::from_env();
+    if !cli.use_http() {
+        // Passing the flag to a stdio run is a mistake worth stopping for. The
+        // same value arriving from the environment or `~/.env` is not: that is
+        // daemon configuration, and an ad-hoc stdio run just ignores it, the
+        // way it ignores the tokens sitting next to it.
+        if std::env::args().any(|arg| arg.starts_with("--allowed-host")) {
+            return Err(AuthConfigError::AllowedHostsWithoutHttp.into());
+        }
+        if !cli.allowed_hosts.is_empty() || !http_env.is_empty() {
+            tracing::debug!("HTTP settings are configured but the transport is stdio; ignoring");
+        }
+    }
+    // Resolve credentials before anything else: a misconfiguration must never
+    // reach the point where a socket is bound.
+    let auth = cli
+        .use_http()
+        .then(|| HttpAuth::resolve(&http_env, cli.insecure_no_auth))
+        .transpose()?;
+
     let client = build_client(&EnvConfig::from_env()).context("failed to build openQA client")?;
     let server = OpenQaServer::new(client, readonly);
-    if cli.use_http() {
-        run_http(server, &cli.host, cli.port).await
-    } else {
-        run_stdio(server).await
+    match auth {
+        Some(auth) => run_http(server, auth, &cli).await,
+        None => run_stdio(server).await,
     }
 }
 
@@ -84,15 +133,24 @@ async fn run_stdio(server: OpenQaServer) -> anyhow::Result<()> {
     if ct.is_cancelled() { Ok(()) } else { result }
 }
 
-async fn run_http(server: OpenQaServer, host: &str, port: u16) -> anyhow::Result<()> {
+async fn run_http(server: OpenQaServer, auth: HttpAuth, cli: &Cli) -> anyhow::Result<()> {
+    let (host, port) = (cli.host.as_str(), cli.port);
     let ct = CancellationToken::new();
-    let service: StreamableHttpService<OpenQaServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Arc::default(),
-            StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+    if auth.is_insecure() {
+        // Straight to stderr, not `tracing::warn!`: with RUST_LOG unset the
+        // subscriber only passes ERROR, and this banner must never be silent.
+        eprintln!(
+            "WARNING: --insecure-no-auth: HTTP is served without authentication; \
+             every caller gets the full write scope"
         );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    }
+    let server = server.with_scope_enforcement(!auth.is_insecure());
+    let router = router(
+        server,
+        Arc::new(auth),
+        allowed_hosts(&cli.allowed_hosts),
+        &ct,
+    );
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;

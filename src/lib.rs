@@ -2,8 +2,10 @@
 
 pub mod cli;
 pub mod config;
+pub mod dotenv;
 pub mod form;
 pub mod heartbeat;
+pub mod http;
 pub mod query;
 pub mod server;
 pub mod summary;
