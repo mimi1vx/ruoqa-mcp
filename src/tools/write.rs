@@ -17,9 +17,11 @@ use serde_json::Value;
 use crate::form::Form;
 use crate::query::{Query, api};
 use crate::server::{OpenQaServer, err, ok, to_result};
+use crate::tools::{MAX_BULK_RESTART_JOBS, MAX_EXTRA_ENTRIES, MAX_RESTART_JOBS, bounded};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RestartJobs {
+    #[schemars(length(min = 1, max = MAX_RESTART_JOBS))]
     pub job_ids: Vec<i64>,
 }
 
@@ -41,6 +43,7 @@ pub struct TriggerIsos {
     pub flavor: String,
     pub arch: String,
     #[serde(default)]
+    #[schemars(extend("maxProperties" = MAX_EXTRA_ENTRIES))]
     pub extra: Option<HashMap<String, String>>,
 }
 
@@ -61,6 +64,7 @@ pub struct SetJobPriority {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RestartJobsBulk {
+    #[schemars(length(min = 1, max = MAX_BULK_RESTART_JOBS))]
     pub job_ids: Vec<i64>,
     #[serde(default)]
     pub force: Option<i64>,
@@ -166,6 +170,12 @@ impl OpenQaServer {
         Parameters(RestartJobs { job_ids }): Parameters<RestartJobs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        bounded(
+            "job_ids (use restart_jobs_bulk for larger sets)",
+            job_ids.len(),
+            1,
+            MAX_RESTART_JOBS,
+        )?;
         let mut results = Vec::with_capacity(job_ids.len());
         for job_id in job_ids {
             match self
@@ -238,6 +248,12 @@ impl OpenQaServer {
         }): Parameters<TriggerIsos>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        bounded(
+            "extra",
+            extra.as_ref().map_or(0, HashMap::len),
+            0,
+            MAX_EXTRA_ENTRIES,
+        )?;
         let mut form = Form::new()
             .push("DISTRI", distri)
             .push("VERSION", version)
@@ -330,6 +346,7 @@ impl OpenQaServer {
         }): Parameters<RestartJobsBulk>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        bounded("job_ids", job_ids.len(), 1, MAX_BULK_RESTART_JOBS)?;
         let form = Form::new()
             .push_all("jobs", &job_ids)
             .push_opt("force", force)

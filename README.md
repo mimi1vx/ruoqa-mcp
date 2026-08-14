@@ -46,6 +46,7 @@ to the openQA client config file for credentials.
 | `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
+| `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds fan-out (e.g. `restart_jobs` looping over many jobs) as well as slow upstreams. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `OPENQA_API_KEY` and `OPENQA_API_SECRET` must both be set together; setting
 only one is a startup error.
@@ -136,6 +137,8 @@ tools get `403`).
 `groupid`, `group`, `latest`, `limit`, `ids`. `list_jobs` additionally accepts
 `offset` for pagination (the overview endpoint returns only the latest job per
 scenario and is not paginated). Unset filters are dropped from the request.
+`ids` accepts at most 500 entries (each becomes a repeated `ids=` query
+parameter; more would risk a `414` from nginx's default request-line limit).
 
 Both also accept `summary` (default `false`). The default full result can be
 very large (~1.5 MB / 150+ jobs for a populated build) and may be truncated by
@@ -180,6 +183,13 @@ Mutating tools carry `destructiveHint`/`readOnlyHint` MCP annotations so
 clients can gate them behind confirmation. To drop them entirely, start the
 server in read-only mode with `--readonly` (or `OPENQA_READONLY=true`): the
 mutating tools are never registered, so clients see only the read tools.
+
+`restart_jobs` restarts each job with a sequential openQA request per id, so
+`job_ids` is capped at 1-50 entries; use `restart_jobs_bulk` (capped at
+1-500, a single bulk request) for larger sets. `trigger_isos`'s `extra` map
+is capped at 100 entries (each becomes a scheduled-product/job-settings row);
+individual values stay unbounded to allow an inline `SCENARIO_DEFINITIONS_YAML`
+document.
 
 ## Running
 

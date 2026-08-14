@@ -123,6 +123,24 @@ pub fn parse_timeout(raw: Option<&str>) -> std::result::Result<Timeouts, Invalid
     Ok(Timeouts::default().total(total))
 }
 
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Whole-tool-call deadline, independent of the per-HTTP-request
+/// `OPENQA_MCP_TIMEOUT`; bounds fan-out (e.g. `restart_jobs`) and slow
+/// upstreams together. Default 300s; `<= 0` disables it (`Ok(None)`).
+///
+/// # Errors
+///
+/// Returns [`InvalidDuration`] if `OPENQA_MCP_CALL_TIMEOUT` is set to an
+/// unparseable, non-finite, or out-of-range value.
+pub fn call_timeout() -> std::result::Result<Option<Duration>, InvalidDuration> {
+    parse_duration_secs(
+        "OPENQA_MCP_CALL_TIMEOUT",
+        std::env::var("OPENQA_MCP_CALL_TIMEOUT").ok().as_deref(),
+        DEFAULT_CALL_TIMEOUT,
+    )
+}
+
 /// The environment variables this server reads, collected up front so the
 /// parsing logic stays pure and testable without mutating `std::env`.
 pub struct EnvConfig {
@@ -243,6 +261,35 @@ mod tests {
         for raw in ["abc", "nan", "NaN", "inf", "-inf", "1e30"] {
             let err = parse_timeout(Some(raw)).unwrap_err();
             assert!(err.to_string().contains("OPENQA_MCP_TIMEOUT"));
+        }
+    }
+
+    #[test]
+    fn call_timeout_defaults_to_300s() {
+        assert_eq!(
+            parse_duration_secs("OPENQA_MCP_CALL_TIMEOUT", None, DEFAULT_CALL_TIMEOUT).unwrap(),
+            Some(Duration::from_mins(5))
+        );
+    }
+
+    #[test]
+    fn call_timeout_zero_or_negative_disables() {
+        for raw in ["0", "-1"] {
+            assert_eq!(
+                parse_duration_secs("OPENQA_MCP_CALL_TIMEOUT", Some(raw), DEFAULT_CALL_TIMEOUT)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn call_timeout_rejects_invalid_values() {
+        for raw in ["abc", "nan", "NaN", "inf", "-inf", "1e300"] {
+            let err =
+                parse_duration_secs("OPENQA_MCP_CALL_TIMEOUT", Some(raw), DEFAULT_CALL_TIMEOUT)
+                    .unwrap_err();
+            assert!(err.to_string().contains("OPENQA_MCP_CALL_TIMEOUT"));
         }
     }
 
