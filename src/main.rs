@@ -96,6 +96,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .transpose()?;
 
     let client = build_client(&EnvConfig::from_env()).context("failed to build openQA client")?;
+    ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
     let server = OpenQaServer::new(client, readonly);
     match auth {
         Some(auth) => run_http(server, auth, &cli).await,

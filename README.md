@@ -45,7 +45,7 @@ to the openQA client config file for credentials.
 | `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. |
-| `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. |
+| `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `OPENQA_API_KEY` and `OPENQA_API_SECRET` must both be set together; setting
 only one is a startup error.
@@ -302,7 +302,7 @@ Flags override the environment, which supplies the defaults (and which
 | `OPENQA_MCP_HTTP_READ_TOKEN` | *(unset)* | Bearer token granting the read scope. |
 | `OPENQA_MCP_ALLOWED_HOSTS` | *(unset)* | Comma-separated default for `--allowed-host`. |
 | `OPENQA_READONLY` | `false` | Set truthy (`1`/`true`/`yes`/`on`) to disable mutating tools. |
-| `OPENQA_MCP_HEARTBEAT_INTERVAL` | `15.0` | Seconds between progress "heartbeat" pings sent while a tool waits on a slow openQA call, so MCP clients see liveness instead of timing out. Set `<=0` to disable. Pings are a no-op unless the client sent a `progressToken`. |
+| `OPENQA_MCP_HEARTBEAT_INTERVAL` | `15.0` | Seconds between progress "heartbeat" pings sent while a tool waits on a slow openQA call, so MCP clients see liveness instead of timing out. Set `<=0` to disable. Pings are a no-op unless the client sent a `progressToken`. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `--readonly` and the read token are different levers: `--readonly` is
 process-wide and unregisters the mutating tools for every caller, including

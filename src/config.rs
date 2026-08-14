@@ -1,5 +1,6 @@
 //! env → `ruoqa::ClientBuilder` (port of `client.py`'s `get_client`).
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,10 +9,32 @@ use ruoqa::{Client, ClientBuilder, Error, Result, Timeouts, TlsMode};
 
 const FALSE_TOKENS: [&str; 3] = ["0", "false", "no"];
 const TRUE_TOKENS: [&str; 3] = ["1", "true", "yes"];
-const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Stand-in for "no timeout": httpx's `Timeout(None)` has no Rust equivalent
 /// here since `Timeouts::total` is a plain `Duration`, not `Option<Duration>`.
 const DISABLED_TIMEOUT: Duration = Duration::from_hours(876_000);
+
+/// An environment variable holding a duration in seconds could not be
+/// interpreted. Always a startup error: a value that reaches this point is
+/// neither unset/empty (treated as the default) nor a well-formed number.
+#[derive(Debug)]
+pub struct InvalidDuration {
+    var: &'static str,
+    raw: String,
+    reason: &'static str,
+}
+
+impl fmt::Display for InvalidDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is set to {:?}, which is not a valid duration ({})",
+            self.var, self.raw, self.reason
+        )
+    }
+}
+
+impl std::error::Error for InvalidDuration {}
 
 /// Map `OPENQA_VERIFY` to a [`TlsMode`]. Bool-ish tokens toggle verification;
 /// any other non-empty value is a path to a CA bundle. Unset/empty defaults
@@ -42,15 +65,62 @@ pub fn parse_verify(raw: Option<&str>) -> Result<TlsMode> {
     })
 }
 
-/// Map `OPENQA_MCP_TIMEOUT` to a [`Timeouts`]. Default `total` is 30s;
-/// `<= 0` disables it; unparseable values fall back to the default.
-pub fn parse_timeout(raw: Option<&str>) -> Timeouts {
-    let default = Timeouts::default().total(Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS));
-    match raw.map(str::parse::<f64>) {
-        None | Some(Err(_)) => default,
-        Some(Ok(v)) if v <= 0.0 => default.total(DISABLED_TIMEOUT),
-        Some(Ok(v)) => default.total(Duration::from_secs_f64(v)),
+/// Parse an environment variable holding a duration in seconds. Unset, empty,
+/// or whitespace-only yields `default`; `<= 0` yields `Ok(None)` ("disabled");
+/// anything else must be a finite, in-range number of seconds or startup
+/// aborts with [`InvalidDuration`] naming `var`.
+///
+/// # Errors
+///
+/// Returns [`InvalidDuration`] if `raw` is set to text that doesn't parse as
+/// an `f64`, or to `NaN`, `±inf`, or a finite value too large for a
+/// [`Duration`].
+pub fn parse_duration_secs(
+    var: &'static str,
+    raw: Option<&str>,
+    default: Duration,
+) -> std::result::Result<Option<Duration>, InvalidDuration> {
+    let trimmed = raw.map_or("", str::trim);
+    if trimmed.is_empty() {
+        return Ok(Some(default));
     }
+    let Ok(v) = trimmed.parse::<f64>() else {
+        return Err(InvalidDuration {
+            var,
+            raw: trimmed.to_string(),
+            reason: "not a number",
+        });
+    };
+    if !v.is_finite() {
+        return Err(InvalidDuration {
+            var,
+            raw: trimmed.to_string(),
+            reason: "must be finite",
+        });
+    }
+    if v <= 0.0 {
+        return Ok(None);
+    }
+    Duration::try_from_secs_f64(v)
+        .map(Some)
+        .map_err(|_| InvalidDuration {
+            var,
+            raw: trimmed.to_string(),
+            reason: "out of range",
+        })
+}
+
+/// Map `OPENQA_MCP_TIMEOUT` to a [`Timeouts`]. Default `total` is 30s;
+/// `<= 0` disables it.
+///
+/// # Errors
+///
+/// Returns [`InvalidDuration`] if the variable is set to an unparseable,
+/// non-finite, or out-of-range value.
+pub fn parse_timeout(raw: Option<&str>) -> std::result::Result<Timeouts, InvalidDuration> {
+    let total = parse_duration_secs("OPENQA_MCP_TIMEOUT", raw, DEFAULT_TIMEOUT)?
+        .unwrap_or(DISABLED_TIMEOUT);
+    Ok(Timeouts::default().total(total))
 }
 
 /// The environment variables this server reads, collected up front so the
@@ -93,7 +163,7 @@ impl EnvConfig {
 )]
 pub fn build_client(env: &EnvConfig) -> Result<Client> {
     let tls = parse_verify(env.verify.as_deref())?;
-    let timeouts = parse_timeout(env.timeout.as_deref());
+    let timeouts = parse_timeout(env.timeout.as_deref()).map_err(|e| Error::Config(Box::new(e)))?;
     let mut builder = ClientBuilder::new()
         .server(env.server.clone().unwrap_or_default())
         .tls(tls)
@@ -141,23 +211,39 @@ mod tests {
 
     #[test]
     fn timeout_defaults_to_30s() {
-        assert_eq!(parse_timeout(None).total, Duration::from_secs(30));
+        assert_eq!(parse_timeout(None).unwrap().total, Duration::from_secs(30));
     }
 
     #[test]
     fn timeout_from_value() {
-        assert_eq!(parse_timeout(Some("60")).total, Duration::from_mins(1));
+        assert_eq!(
+            parse_timeout(Some("60")).unwrap().total,
+            Duration::from_mins(1)
+        );
     }
 
     #[test]
     fn timeout_zero_or_negative_disables() {
-        assert_eq!(parse_timeout(Some("0")).total, DISABLED_TIMEOUT);
-        assert_eq!(parse_timeout(Some("-1")).total, DISABLED_TIMEOUT);
+        assert_eq!(parse_timeout(Some("0")).unwrap().total, DISABLED_TIMEOUT);
+        assert_eq!(parse_timeout(Some("-1")).unwrap().total, DISABLED_TIMEOUT);
     }
 
     #[test]
-    fn timeout_malformed_falls_back_to_default() {
-        assert_eq!(parse_timeout(Some("abc")).total, Duration::from_secs(30));
+    fn timeout_blank_is_unset() {
+        for raw in ["", "   "] {
+            assert_eq!(
+                parse_timeout(Some(raw)).unwrap().total,
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_rejects_invalid_values() {
+        for raw in ["abc", "nan", "NaN", "inf", "-inf", "1e30"] {
+            let err = parse_timeout(Some(raw)).unwrap_err();
+            assert!(err.to_string().contains("OPENQA_MCP_TIMEOUT"));
+        }
     }
 
     #[test]
