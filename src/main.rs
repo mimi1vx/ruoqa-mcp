@@ -97,7 +97,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let client = build_client(&EnvConfig::from_env()).context("failed to build openQA client")?;
     ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
-    let server = OpenQaServer::new(client, readonly);
+    let call_timeout =
+        ruoqa_mcp::config::call_timeout().context("invalid OPENQA_MCP_CALL_TIMEOUT")?;
+    let server = OpenQaServer::new(client, readonly).with_call_timeout(call_timeout);
     match auth {
         Some(auth) => run_http(server, auth, &cli).await,
         None => run_stdio(server).await,

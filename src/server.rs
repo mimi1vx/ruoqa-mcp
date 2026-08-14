@@ -1,6 +1,8 @@
 //! The `OpenQaServer` handler and the request funnel (port of `server.py`'s
 //! `mcp`, `_client`, and `_request`).
 
+use std::time::Duration;
+
 use reqwest::Method;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -23,6 +25,10 @@ trigger ISOs, and require API credentials.";
 /// a caller learns that it may not do this, not how the gate is wired.
 const DENIED: &str = "this credential is not authorized for mutating tools";
 
+/// Mirrors `config::call_timeout`'s default; kept here too so a bare `new`
+/// (as used by tests) still gets a deadline without every caller opting in.
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_mins(5);
+
 #[derive(Clone)]
 pub struct OpenQaServer {
     pub(crate) client: ruoqa::Client,
@@ -30,6 +36,9 @@ pub struct OpenQaServer {
     /// Whether each request must carry a [`Scope`]. Off for stdio, where the
     /// process credential is the only principal there is.
     enforce_scopes: bool,
+    /// Whole-call deadline, independent of the per-HTTP-request timeout.
+    /// `None` disables it.
+    call_timeout: Option<Duration>,
 }
 
 impl OpenQaServer {
@@ -47,6 +56,7 @@ impl OpenQaServer {
             client,
             tool_router,
             enforce_scopes: false,
+            call_timeout: Some(DEFAULT_CALL_TIMEOUT),
         }
     }
 
@@ -55,6 +65,13 @@ impl OpenQaServer {
     #[must_use]
     pub fn with_scope_enforcement(mut self, yes: bool) -> Self {
         self.enforce_scopes = yes;
+        self
+    }
+
+    /// Set the whole-call deadline; `None` disables it.
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.call_timeout = timeout;
         self
     }
 
@@ -145,7 +162,21 @@ impl ServerHandler for OpenQaServer {
     ) -> Result<CallToolResponse, ErrorData> {
         self.authorize(&request.name, &context)?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        let dispatch = self.tool_router.call(tcc);
+        match self.call_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, dispatch)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ErrorData::internal_error(
+                        format!(
+                            "tool call exceeded the {}s deadline (OPENQA_MCP_CALL_TIMEOUT)",
+                            timeout.as_secs_f64()
+                        ),
+                        None,
+                    ))
+                }),
+            None => dispatch.await,
+        }
     }
 
     /// The macro's body, minus the tools this principal could not call anyway.

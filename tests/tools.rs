@@ -2,6 +2,8 @@
 //! an in-memory MCP session (a `tokio::io::duplex` pair) so tool calls go
 //! through the real router/handler, not internal shortcuts.
 
+use std::time::Duration;
+
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -20,6 +22,23 @@ async fn server_with_client(
     api_key: Option<&str>,
     api_secret: Option<&str>,
 ) -> RunningService<RoleClient, ()> {
+    run_server(mock, readonly, api_key, api_secret, None).await
+}
+
+async fn server_with_call_timeout(
+    mock: &MockServer,
+    timeout: Duration,
+) -> RunningService<RoleClient, ()> {
+    run_server(mock, false, None, None, Some(timeout)).await
+}
+
+async fn run_server(
+    mock: &MockServer,
+    readonly: bool,
+    api_key: Option<&str>,
+    api_secret: Option<&str>,
+    call_timeout: Option<Duration>,
+) -> RunningService<RoleClient, ()> {
     let mut builder = ruoqa::ClientBuilder::new()
         .server(mock.uri())
         .config_paths(vec![]);
@@ -29,7 +48,10 @@ async fn server_with_client(
             .api_secret(ruoqa::ApiSecret::new(secret));
     }
     let client = builder.build().expect("build client");
-    let server = OpenQaServer::new(client, readonly);
+    let mut server = OpenQaServer::new(client, readonly);
+    if let Some(timeout) = call_timeout {
+        server = server.with_call_timeout(Some(timeout));
+    }
 
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -429,6 +451,298 @@ async fn cancel_scheduled_product_rejects_empty_and_dot_names() {
             "name {name:?} must send no HTTP request"
         );
     }
+}
+
+#[tokio::test]
+async fn list_jobs_ids_over_limit_is_rejected_with_no_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let ids: Vec<i64> = (1..=501).collect();
+    let err = call(&client, "list_jobs", json!({"ids": ids}))
+        .await
+        .expect_err("over-limit ids must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn list_jobs_ids_at_limit_reaches_mock() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let ids: Vec<i64> = (1..=500).collect();
+    call(&client, "list_jobs", json!({"ids": ids}))
+        .await
+        .expect("at-limit ids call should succeed");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn restart_jobs_over_limit_names_restart_jobs_bulk_and_sends_no_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let job_ids: Vec<i64> = (1..=51).collect();
+    let err = call(&client, "restart_jobs", json!({"job_ids": job_ids}))
+        .await
+        .expect_err("over-limit job_ids must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mcp_err.message.contains("restart_jobs_bulk"),
+        "message should point at restart_jobs_bulk: {}",
+        mcp_err.message
+    );
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restart_jobs_empty_is_rejected() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(&client, "restart_jobs", json!({"job_ids": []}))
+        .await
+        .expect_err("empty job_ids must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restart_jobs_at_limit_reaches_mock_for_each_job() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let job_ids: Vec<i64> = (1..=50).collect();
+    call(&client, "restart_jobs", json!({"job_ids": job_ids}))
+        .await
+        .expect("at-limit call should succeed");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 50);
+}
+
+#[tokio::test]
+async fn restart_jobs_bulk_over_limit_is_rejected_with_no_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/restart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let job_ids: Vec<i64> = (1..=501).collect();
+    let err = call(&client, "restart_jobs_bulk", json!({"job_ids": job_ids}))
+        .await
+        .expect_err("over-limit job_ids must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restart_jobs_bulk_empty_is_rejected() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/restart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(&client, "restart_jobs_bulk", json!({"job_ids": []}))
+        .await
+        .expect_err("empty job_ids must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restart_jobs_bulk_at_limit_reaches_mock() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/restart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let job_ids: Vec<i64> = (1..=500).collect();
+    call(&client, "restart_jobs_bulk", json!({"job_ids": job_ids}))
+        .await
+        .expect("at-limit call should succeed");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let body = String::from_utf8_lossy(&requests.last().unwrap().body);
+    assert_eq!(body.matches("jobs=").count(), 500);
+}
+
+fn extra_map(n: usize) -> Value {
+    let map: serde_json::Map<String, Value> = (0..n)
+        .map(|i| (format!("KEY{i}"), json!(format!("value{i}"))))
+        .collect();
+    Value::Object(map)
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_over_limit_is_rejected_with_no_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/isos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(
+        &client,
+        "trigger_isos",
+        json!({
+            "distri": "opensuse",
+            "version": "15.5",
+            "flavor": "DVD",
+            "arch": "x86_64",
+            "extra": extra_map(101),
+        }),
+    )
+    .await
+    .expect_err("over-limit extra must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_at_limit_reaches_mock() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/isos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    call(
+        &client,
+        "trigger_isos",
+        json!({
+            "distri": "opensuse",
+            "version": "15.5",
+            "flavor": "DVD",
+            "arch": "x86_64",
+            "extra": extra_map(100),
+        }),
+    )
+    .await
+    .expect("at-limit call should succeed");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn call_exceeding_the_deadline_fails_instead_of_hanging() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jobs": []}))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_call_timeout(&mock, Duration::from_millis(50)).await;
+
+    let err = call(&client, "list_jobs", json!({}))
+        .await
+        .expect_err("call must fail once the deadline elapses");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert!(
+        mcp_err.message.contains("OPENQA_MCP_CALL_TIMEOUT"),
+        "message should name the deadline variable: {}",
+        mcp_err.message
+    );
 }
 
 #[tokio::test]

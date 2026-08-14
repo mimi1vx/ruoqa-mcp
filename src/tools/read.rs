@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::query::{Query, api};
 use crate::server::{OpenQaServer, to_result};
 use crate::summary::summarize_jobs;
+use crate::tools::{MAX_IDS, bounded};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListJobsArgs {
@@ -42,6 +43,7 @@ pub struct ListJobsArgs {
     #[serde(default)]
     pub offset: Option<i64>,
     #[serde(default)]
+    #[schemars(length(max = MAX_IDS))]
     pub ids: Option<Vec<i64>>,
     #[serde(default)]
     pub summary: bool,
@@ -74,6 +76,7 @@ pub struct ListJobsOverviewArgs {
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
+    #[schemars(length(max = MAX_IDS))]
     pub ids: Option<Vec<i64>>,
     #[serde(default)]
     pub summary: bool,
@@ -149,6 +152,7 @@ temporary file and process it with jq, e.g. `jq '.jobs[] | select(.result==\"fai
         Parameters(args): Parameters<ListJobsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        bounded("ids", args.ids.as_ref().map_or(0, Vec::len), 0, MAX_IDS)?;
         let path = Query::new()
             .push("state", args.state)
             .push("result", args.result)
@@ -191,6 +195,7 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
         Parameters(args): Parameters<ListJobsOverviewArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        bounded("ids", args.ids.as_ref().map_or(0, Vec::len), 0, MAX_IDS)?;
         let path = Query::new()
             .push("state", args.state)
             .push("result", args.result)
