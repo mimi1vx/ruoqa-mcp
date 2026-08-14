@@ -44,7 +44,7 @@ to the openQA client config file for credentials.
 | `OPENQA_SERVER` | *(unset)* | openQA host (e.g. `openqa.opensuse.org`). Empty falls back to ruoqa's `client.conf` discovery. |
 | `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
-| `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. |
+| `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. See the warning below before using `false`. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 | `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds fan-out (e.g. `restart_jobs` looping over many jobs) as well as slow upstreams. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
@@ -55,6 +55,20 @@ only one is a startup error.
 bundle (it replaces the platform trust store rather than merging with it),
 matching httpx's `verify=<path>` semantics. If a deployment relies on merging
 a custom CA with the platform roots, this is stricter than before.
+
+> **`OPENQA_VERIFY=false` disables certificate verification for every openQA
+> request.** Any certificate is then accepted, so anything able to intercept
+> the connection can read and replay the API key, the signed request, and
+> every response. Prefer pointing `OPENQA_VERIFY` at your company or
+> self-signed CA bundle instead — that keeps verification on while trusting
+> your own root. Treat `false` as a last resort for throwaway debugging on a
+> network you control, never as a deployment setting.
+>
+> The server deliberately does not refuse to start in this mode: whether it
+> is acceptable is the operator's call. `ruoqa` separately logs a warning
+> when credentials are sent over plaintext `http://` to a non-loopback host
+> — run with `RUST_LOG=warn` to see it, since the default filter passes only
+> errors.
 
 ### `~/.env`
 
