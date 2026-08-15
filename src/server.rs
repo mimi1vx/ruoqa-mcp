@@ -13,6 +13,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
+use crate::error::{classify, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
@@ -126,16 +127,11 @@ pub(crate) fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "used as map_err(err), which requires a by-value fn"
-)]
-pub(crate) fn err(e: ruoqa::Error) -> ErrorData {
-    ErrorData::internal_error(e.to_string(), None)
-}
-
 pub(crate) fn to_result(result: ruoqa::Result<Value>) -> Result<CallToolResult, ErrorData> {
-    result.map_err(err).and_then(ok)
+    match result {
+        Ok(value) => ok(value),
+        Err(e) => classify(e),
+    }
 }
 
 /// A tool is non-mutating only if it says so itself. Derived from the
@@ -164,17 +160,20 @@ impl ServerHandler for OpenQaServer {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let dispatch = self.tool_router.call(tcc);
         match self.call_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, dispatch)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ErrorData::internal_error(
-                        format!(
-                            "tool call exceeded the {}s deadline (OPENQA_MCP_CALL_TIMEOUT)",
-                            timeout.as_secs_f64()
-                        ),
-                        None,
-                    ))
-                }),
+            Some(timeout) => match tokio::time::timeout(timeout, dispatch).await {
+                Ok(result) => result,
+                Err(_) => Ok(tool_error(
+                    "timeout",
+                    None,
+                    format!(
+                        "tool call exceeded the {}s deadline (OPENQA_MCP_CALL_TIMEOUT); an \
+                         in-flight write may already have been applied",
+                        timeout.as_secs_f64()
+                    ),
+                    None,
+                )?
+                .into()),
+            },
             None => dispatch.await,
         }
     }

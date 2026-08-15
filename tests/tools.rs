@@ -39,8 +39,21 @@ async fn run_server(
     api_secret: Option<&str>,
     call_timeout: Option<Duration>,
 ) -> RunningService<RoleClient, ()> {
+    run_server_at(&mock.uri(), readonly, api_key, api_secret, call_timeout).await
+}
+
+/// Same as `run_server`, but against an arbitrary `server` URL rather than a
+/// live `MockServer` — for cases (e.g. connection refused) where there is no
+/// listener at all.
+async fn run_server_at(
+    server: &str,
+    readonly: bool,
+    api_key: Option<&str>,
+    api_secret: Option<&str>,
+    call_timeout: Option<Duration>,
+) -> RunningService<RoleClient, ()> {
     let mut builder = ruoqa::ClientBuilder::new()
-        .server(mock.uri())
+        .server(server)
         .config_paths(vec![]);
     if let (Some(key), Some(secret)) = (api_key, api_secret) {
         builder = builder
@@ -334,19 +347,115 @@ async fn unauthenticated_write_403_becomes_error_without_secret() {
         .await;
     let client = server_with_client(&mock, false, Some("KEY"), Some("TOPSECRET")).await;
 
-    let err = call(&client, "cancel_job", json!({"job_id": 7}))
+    let result = call(&client, "cancel_job", json!({"job_id": 7}))
         .await
-        .expect_err("expected an error");
+        .expect("a 403 is a tool-level error, not a protocol error");
 
-    let message = err.to_string();
+    assert_eq!(result.is_error, Some(true));
+    let payload = text(&result);
+    assert_eq!(payload["error"]["kind"], "forbidden");
+    assert_eq!(payload["error"]["status"], 403);
+    assert_eq!(payload["error"]["body"], "Forbidden");
+    let raw = payload.to_string();
     assert!(
-        message.contains("403"),
-        "message should mention 403: {message}"
+        !raw.contains("TOPSECRET"),
+        "payload must not leak the API secret: {raw}"
     );
-    assert!(
-        !message.contains("TOPSECRET"),
-        "message must not leak the API secret: {message}"
-    );
+}
+
+/// Table-driven: every `Request` status maps to its documented `kind`.
+#[tokio::test]
+async fn request_statuses_map_to_documented_kinds() {
+    let cases = [
+        (401u16, "unauthorized"),
+        (403, "forbidden"),
+        (404, "not_found"),
+        (429, "rate_limited"),
+        (500, "server_error"),
+    ];
+    for (status, kind) in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/jobs/1"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("upstream said so"))
+            .mount(&mock)
+            .await;
+        let client = server_with_mock(&mock, true).await;
+
+        let result = call(&client, "get_job", json!({"job_id": 1}))
+            .await
+            .unwrap_or_else(|e| panic!("status {status} should be a tool-level error, got {e}"));
+
+        assert_eq!(result.is_error, Some(true), "status {status}");
+        let payload = text(&result);
+        assert_eq!(payload["error"]["kind"], kind, "status {status}");
+        assert_eq!(payload["error"]["status"], status, "status {status}");
+        assert_eq!(
+            payload["error"]["body"], "upstream said so",
+            "status {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connection_refused_becomes_a_connection_kind_error() {
+    // Bind then immediately drop a listener: the port stays free of any
+    // other process but nothing is listening, so a connect attempt is
+    // refused deterministically without touching the network.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    let client = run_server_at(&format!("http://{addr}"), true, None, None, None).await;
+
+    let result = call(&client, "get_job", json!({"job_id": 1}))
+        .await
+        .expect("a connection failure is a tool-level error, not a protocol error");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "connection");
+}
+
+#[tokio::test]
+async fn oversized_body_becomes_a_response_too_large_kind_error() {
+    let mock = MockServer::start().await;
+    // Comfortably over ruoqa's default 32 MiB max_response_bytes.
+    let huge = "x".repeat(33 * 1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job", json!({"job_id": 1}))
+        .await
+        .expect("an oversized body is a tool-level error, not a protocol error");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "response_too_large");
+}
+
+#[tokio::test]
+async fn garbage_body_becomes_an_invalid_response_kind_error() {
+    let mock = MockServer::start().await;
+    // A JSON content type with an unparsable body: BodyKind::Text would
+    // swallow this silently, so the content type must say JSON to reach
+    // ruoqa's Error::Parse.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("not json { at all", "application/json"),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job", json!({"job_id": 1}))
+        .await
+        .expect("an unparsable body is a tool-level error, not a protocol error");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "invalid_response");
 }
 
 #[tokio::test]
@@ -851,17 +960,17 @@ async fn call_exceeding_the_deadline_fails_instead_of_hanging() {
         .await;
     let client = server_with_call_timeout(&mock, Duration::from_millis(50)).await;
 
-    let err = call(&client, "list_jobs", json!({}))
+    let result = call(&client, "list_jobs", json!({}))
         .await
-        .expect_err("call must fail once the deadline elapses");
+        .expect("the deadline is a tool-level error, not a protocol error");
 
-    let rmcp::ServiceError::McpError(mcp_err) = err else {
-        panic!("expected McpError, got {err:?}");
-    };
+    assert_eq!(result.is_error, Some(true));
+    let payload = text(&result);
+    assert_eq!(payload["error"]["kind"], "timeout");
+    let message = payload["error"]["message"].as_str().unwrap();
     assert!(
-        mcp_err.message.contains("OPENQA_MCP_CALL_TIMEOUT"),
-        "message should name the deadline variable: {}",
-        mcp_err.message
+        message.contains("OPENQA_MCP_CALL_TIMEOUT"),
+        "message should name the deadline variable: {message}"
     );
 }
 
