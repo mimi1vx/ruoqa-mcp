@@ -670,6 +670,92 @@ async fn trigger_isos_extra_at_limit_reaches_mock() {
     assert_eq!(requests.len(), 1);
 }
 
+async fn assert_extra_rejected(extra: Value) {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/isos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(
+        &client,
+        "trigger_isos",
+        json!({
+            "distri": "opensuse",
+            "version": "15.5",
+            "flavor": "DVD",
+            "arch": "x86_64",
+            "extra": extra,
+        }),
+    )
+    .await
+    .expect_err("colliding extra key must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_lowercase_reserved_key_is_rejected() {
+    assert_extra_rejected(json!({"distri": "tumbleweed"})).await;
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_mixed_case_reserved_key_is_rejected() {
+    assert_extra_rejected(json!({"Arch": "aarch64"})).await;
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_internal_case_collision_is_rejected() {
+    assert_extra_rejected(json!({"foo": "1", "FOO": "2"})).await;
+}
+
+#[tokio::test]
+async fn trigger_isos_extra_async_and_settings_still_reach_the_mock() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/isos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    call(
+        &client,
+        "trigger_isos",
+        json!({
+            "distri": "opensuse",
+            "version": "15.5",
+            "flavor": "DVD",
+            "arch": "x86_64",
+            "extra": {"async": "1", "MY_SETTING": "x"},
+        }),
+    )
+    .await
+    .expect("async and ordinary settings are not reserved");
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let body = String::from_utf8_lossy(&requests.last().unwrap().body);
+    assert!(
+        body.contains("async=1"),
+        "body should contain async=1: {body}"
+    );
+    assert!(
+        body.contains("MY_SETTING=x"),
+        "body should contain MY_SETTING=x: {body}"
+    );
+}
+
 #[tokio::test]
 async fn call_exceeding_the_deadline_fails_instead_of_hanging() {
     let mock = MockServer::start().await;
