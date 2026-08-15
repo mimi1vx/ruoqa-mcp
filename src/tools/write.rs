@@ -131,6 +131,33 @@ fn nonblank(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
+/// openQA upcases every `extra` POST key except `async` and
+/// `scheduled_product_clone_id` before storing it, so `distri`, `Distri`, and
+/// `DISTRI` all collide with the same required product field.
+const RESERVED_ISO_KEYS: [&str; 4] = ["DISTRI", "VERSION", "FLAVOR", "ARCH"];
+
+/// Reject an `extra` key that upstream's upcasing would fold into a required
+/// product field, or two `extra` keys that would fold into each other.
+fn check_extra_keys(extra: &HashMap<String, String>) -> Result<(), ErrorData> {
+    let mut seen: HashMap<String, &String> = HashMap::new();
+    for key in extra.keys() {
+        let upper = key.to_ascii_uppercase();
+        if RESERVED_ISO_KEYS.contains(&upper.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!("extra key {key:?} duplicates the required {upper} parameter"),
+                None,
+            ));
+        }
+        if let Some(other) = seen.insert(upper.clone(), key) {
+            return Err(ErrorData::invalid_params(
+                format!("extra keys {other:?} and {key:?} both upcase to {upper}"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Encode set = complement of RFC 3986 unreserved (`A-Za-z0-9` plus `-._~`).
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -245,6 +272,9 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
             0,
             MAX_EXTRA_ENTRIES,
         )?;
+        if let Some(extra) = extra.as_ref() {
+            check_extra_keys(extra)?;
+        }
         let mut form = Form::new()
             .push("DISTRI", distri)
             .push("VERSION", version)

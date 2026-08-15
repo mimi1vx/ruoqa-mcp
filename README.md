@@ -203,7 +203,8 @@ one id missing its assets) is reported by openQA itself in the response's
 `result`/`errors`/`warnings` fields rather than as an MCP error. `trigger_isos`'s
 `extra` map is capped at 100 entries (each becomes a scheduled-product/job-settings
 row); individual values stay unbounded to allow an inline
-`SCENARIO_DEFINITIONS_YAML` document.
+`SCENARIO_DEFINITIONS_YAML` document. `extra` keys may not collide,
+case-insensitively, with `distri`/`version`/`flavor`/`arch` or with each other.
 
 ## Running
 
