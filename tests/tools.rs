@@ -153,6 +153,87 @@ async fn list_jobs_overview_summary_accepts_bare_array() {
     assert_eq!(summary["by_result"], json!({"passed": 1}));
 }
 
+async fn assert_summary_shape_rejected(tool: &str, upstream_path: &str, body: Value) {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(upstream_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let err = call(&client, tool, json!({"summary": true}))
+        .await
+        .expect_err("malformed jobs shape must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+}
+
+#[tokio::test]
+async fn list_jobs_summary_rejects_missing_jobs_key() {
+    assert_summary_shape_rejected("list_jobs", "/api/v1/jobs", json!({})).await;
+}
+
+#[tokio::test]
+async fn list_jobs_summary_rejects_non_array_jobs() {
+    assert_summary_shape_rejected("list_jobs", "/api/v1/jobs", json!({"jobs": "oops"})).await;
+}
+
+#[tokio::test]
+async fn list_jobs_summary_rejects_unrelated_object() {
+    assert_summary_shape_rejected("list_jobs", "/api/v1/jobs", json!({"error": "nope"})).await;
+}
+
+#[tokio::test]
+async fn list_jobs_summary_rejects_top_level_array() {
+    assert_summary_shape_rejected("list_jobs", "/api/v1/jobs", json!([{"id": 1}])).await;
+}
+
+#[tokio::test]
+async fn list_jobs_summary_false_passes_malformed_body_through_unchanged() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"unexpected": true})))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let result = call(&client, "list_jobs", json!({"summary": false}))
+        .await
+        .expect("summary=false must not validate shape");
+
+    assert_eq!(text(&result), json!({"unexpected": true}));
+}
+
+#[tokio::test]
+async fn list_jobs_overview_summary_rejects_missing_jobs_key() {
+    assert_summary_shape_rejected("list_jobs_overview", "/api/v1/jobs/overview", json!({})).await;
+}
+
+#[tokio::test]
+async fn list_jobs_overview_summary_rejects_non_array_jobs() {
+    assert_summary_shape_rejected(
+        "list_jobs_overview",
+        "/api/v1/jobs/overview",
+        json!({"jobs": "oops"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn list_jobs_overview_summary_rejects_unrelated_object() {
+    assert_summary_shape_rejected(
+        "list_jobs_overview",
+        "/api/v1/jobs/overview",
+        json!({"error": "nope"}),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn add_job_comment_is_form_encoded_not_json() {
     let mock = MockServer::start().await;
