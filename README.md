@@ -206,6 +206,25 @@ row); individual values stay unbounded to allow an inline
 `SCENARIO_DEFINITIONS_YAML` document. `extra` keys may not collide,
 case-insensitively, with `distri`/`version`/`flavor`/`arch` or with each other.
 
+### Errors
+
+A tool call fails one of two ways:
+
+- **The tool ran and openQA (or the network) said no.** The MCP call still
+  succeeds (`isError: true`), with a caller-visible payload:
+  `{"error": {"kind", "status"?, "message", "body"?}}`. `body` is openQA's
+  response body, truncated to 512 bytes. `kind` is one of: `unauthorized`,
+  `forbidden`, `not_found`, `rate_limited`, `bad_request`, `server_error`,
+  `connection`, `timeout`, `response_too_large`, `invalid_response`.
+- **The server itself is misconfigured or refused to route the request**
+  (bad `client.conf`, TLS setup failure, incomplete credentials, a
+  cross-origin or outside-base-URL request). This is a JSON-RPC
+  `internal_error`, which most MCP clients render opaquely.
+
+`OPENQA_MCP_CALL_TIMEOUT` firing is reported as a `kind: "timeout"` tool
+error, not a protocol error: the tool call may have reached openQA, so an
+in-flight write may already have been applied.
+
 ## Running
 
 ### stdio (default)

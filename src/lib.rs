@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod dotenv;
+pub(crate) mod error;
 pub mod form;
 pub mod heartbeat;
 pub mod http;
