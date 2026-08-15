@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "ruoqa-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
