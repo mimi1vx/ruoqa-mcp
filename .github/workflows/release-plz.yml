@@ -37,7 +37,7 @@ jobs:
     if: needs.release-plz-release.outputs.releases_created == 'true'
     permissions:
       id-token: write
-      contents: write # binaries job (in release.yml) needs to upload assets — caller-capped
+      contents: write # assets job (in release.yml) needs to upload assets — caller-capped
     uses: ./.github/workflows/release.yml
     with:
       ref: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
