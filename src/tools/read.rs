@@ -138,6 +138,32 @@ pub struct ParentGroupId {
     pub parent_group_id: i64,
 }
 
+/// Pull the `jobs` array a summary is built from, rejecting any shape other
+/// than openQA's documented ones. `list_jobs` always renders `{"jobs": \
+/// [...]}`; `list_jobs_overview` renders a bare array. A mismatch here is an
+/// upstream-contract violation, not a caller error, so it is reported as
+/// `internal_error` without echoing the (potentially huge) response body.
+fn jobs_array<'a>(
+    tool: &str,
+    value: &'a Value,
+    allow_top_level_array: bool,
+) -> Result<&'a Vec<Value>, ErrorData> {
+    if allow_top_level_array && let Some(arr) = value.as_array() {
+        return Ok(arr);
+    }
+    value.get("jobs").and_then(Value::as_array).ok_or_else(|| {
+        let expected = if allow_top_level_array {
+            "a bare array or an object with a \"jobs\" array"
+        } else {
+            "an object with a \"jobs\" array"
+        };
+        ErrorData::internal_error(
+            format!("{tool}: expected {expected} from openQA, got a different shape"),
+            None,
+        )
+    })
+}
+
 #[tool_router(router = read_tool_router, vis = "pub(crate)")]
 impl OpenQaServer {
     #[tool(
@@ -171,13 +197,9 @@ temporary file and process it with jq, e.g. `jq '.jobs[] | select(.result==\"fai
             .finish(&api("jobs"));
         let body = self.request_json(&ctx, Method::GET, &path).await;
         match body {
-            Ok(value) if args.summary && value.is_object() => {
-                let jobs = value
-                    .get("jobs")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                to_result(Ok(summarize_jobs(&jobs)))
+            Ok(value) if args.summary => {
+                let jobs = jobs_array("list_jobs", &value, false)?;
+                to_result(Ok(summarize_jobs(jobs)))
             }
             other => to_result(other),
         }
@@ -214,16 +236,8 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
         let body = self.request_json(&ctx, Method::GET, &path).await;
         match body {
             Ok(value) if args.summary => {
-                let jobs = if let Some(arr) = value.as_array() {
-                    arr.clone()
-                } else {
-                    value
-                        .get("jobs")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                };
-                to_result(Ok(summarize_jobs(&jobs)))
+                let jobs = jobs_array("list_jobs_overview", &value, true)?;
+                to_result(Ok(summarize_jobs(jobs)))
             }
             other => to_result(other),
         }
