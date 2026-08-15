@@ -271,7 +271,7 @@ authentication is mandatory and deny-by-default. Two tokens define two scopes:
 
 | Token | Scope | Tools |
 | --- | --- | --- |
-| `OPENQA_MCP_HTTP_TOKEN` | write | all 40 read + mutating tools |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 39 read + mutating tools |
 | `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 25 read tools only |
 
 Either may be set alone. A read-scope caller sees only the read tools in
