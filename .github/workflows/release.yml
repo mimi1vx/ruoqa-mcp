@@ -80,8 +80,16 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.ref || github.ref_name }}"
-          gh release create "$TAG" --repo "${{ github.repository }}" --generate-notes || true
-          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber dist/*
+          REPO="${{ github.repository }}"
+          if out=$(gh release view "$TAG" --repo "$REPO" --json tagName 2>&1); then
+            echo "::notice::Release $TAG already exists; reusing it."
+          elif printf '%s' "$out" | grep -qi 'release not found'; then
+            gh release create "$TAG" --repo "$REPO" --generate-notes --verify-tag
+          else
+            printf '%s\n' "$out" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" --repo "$REPO" --clobber dist/*
 
   publish:
     needs: assets
