@@ -185,7 +185,7 @@ async fn add_job_comment_is_form_encoded_not_json() {
 }
 
 #[tokio::test]
-async fn restart_jobs_bulk_repeats_jobs_key() {
+async fn restart_jobs_sends_one_request_with_repeated_jobs_key() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/jobs/restart"))
@@ -194,13 +194,36 @@ async fn restart_jobs_bulk_repeats_jobs_key() {
         .await;
     let client = server_with_mock(&mock, false).await;
 
-    call(&client, "restart_jobs_bulk", json!({"job_ids": [1, 2]}))
+    call(&client, "restart_jobs", json!({"job_ids": [1, 2]}))
         .await
         .expect("call_tool");
 
     let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests.last().unwrap().body);
     assert_eq!(body, "jobs=1&jobs=2");
+}
+
+#[tokio::test]
+async fn restart_jobs_partial_outcome_is_a_success() {
+    let mock = MockServer::start().await;
+    let upstream_body = json!({
+        "result": [{"1": 11}],
+        "errors": ["Job 2 misses the following mandatory assets: ..."],
+        "enforceable": 1
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/restart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, false).await;
+
+    let result = call(&client, "restart_jobs", json!({"job_ids": [1, 2]}))
+        .await
+        .expect("a partial upstream failure is still a successful tool call");
+
+    assert_eq!(text(&result), upstream_body);
 }
 
 #[tokio::test]
@@ -500,7 +523,7 @@ async fn list_jobs_ids_at_limit_reaches_mock() {
 }
 
 #[tokio::test]
-async fn restart_jobs_over_limit_names_restart_jobs_bulk_and_sends_no_request() {
+async fn restart_jobs_over_limit_is_rejected_with_no_request() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
@@ -508,7 +531,7 @@ async fn restart_jobs_over_limit_names_restart_jobs_bulk_and_sends_no_request() 
         .await;
     let client = server_with_mock(&mock, false).await;
 
-    let job_ids: Vec<i64> = (1..=51).collect();
+    let job_ids: Vec<i64> = (1..=501).collect();
     let err = call(&client, "restart_jobs", json!({"job_ids": job_ids}))
         .await
         .expect_err("over-limit job_ids must be rejected");
@@ -518,8 +541,8 @@ async fn restart_jobs_over_limit_names_restart_jobs_bulk_and_sends_no_request() 
     };
     assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     assert!(
-        mcp_err.message.contains("restart_jobs_bulk"),
-        "message should point at restart_jobs_bulk: {}",
+        !mcp_err.message.contains("restart_jobs_bulk"),
+        "restart_jobs_bulk no longer exists, message should not name it: {}",
         mcp_err.message
     );
     assert!(
@@ -556,78 +579,7 @@ async fn restart_jobs_empty_is_rejected() {
 }
 
 #[tokio::test]
-async fn restart_jobs_at_limit_reaches_mock_for_each_job() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
-        .mount(&mock)
-        .await;
-    let client = server_with_mock(&mock, false).await;
-
-    let job_ids: Vec<i64> = (1..=50).collect();
-    call(&client, "restart_jobs", json!({"job_ids": job_ids}))
-        .await
-        .expect("at-limit call should succeed");
-
-    let requests = mock.received_requests().await.expect("recorded requests");
-    assert_eq!(requests.len(), 50);
-}
-
-#[tokio::test]
-async fn restart_jobs_bulk_over_limit_is_rejected_with_no_request() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/jobs/restart"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
-        .mount(&mock)
-        .await;
-    let client = server_with_mock(&mock, false).await;
-
-    let job_ids: Vec<i64> = (1..=501).collect();
-    let err = call(&client, "restart_jobs_bulk", json!({"job_ids": job_ids}))
-        .await
-        .expect_err("over-limit job_ids must be rejected");
-
-    let rmcp::ServiceError::McpError(mcp_err) = err else {
-        panic!("expected McpError, got {err:?}");
-    };
-    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-    assert!(
-        mock.received_requests()
-            .await
-            .expect("recorded requests")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn restart_jobs_bulk_empty_is_rejected() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/jobs/restart"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": []})))
-        .mount(&mock)
-        .await;
-    let client = server_with_mock(&mock, false).await;
-
-    let err = call(&client, "restart_jobs_bulk", json!({"job_ids": []}))
-        .await
-        .expect_err("empty job_ids must be rejected");
-
-    let rmcp::ServiceError::McpError(mcp_err) = err else {
-        panic!("expected McpError, got {err:?}");
-    };
-    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-    assert!(
-        mock.received_requests()
-            .await
-            .expect("recorded requests")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn restart_jobs_bulk_at_limit_reaches_mock() {
+async fn restart_jobs_at_limit_reaches_mock() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/jobs/restart"))
@@ -637,11 +589,12 @@ async fn restart_jobs_bulk_at_limit_reaches_mock() {
     let client = server_with_mock(&mock, false).await;
 
     let job_ids: Vec<i64> = (1..=500).collect();
-    call(&client, "restart_jobs_bulk", json!({"job_ids": job_ids}))
+    call(&client, "restart_jobs", json!({"job_ids": job_ids}))
         .await
         .expect("at-limit call should succeed");
 
     let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests.last().unwrap().body);
     assert_eq!(body.matches("jobs=").count(), 500);
 }

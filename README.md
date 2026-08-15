@@ -46,7 +46,7 @@ to the openQA client config file for credentials.
 | `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. See the warning below before using `false`. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
-| `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds fan-out (e.g. `restart_jobs` looping over many jobs) as well as slow upstreams. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
+| `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds a slow upstream regardless of which tool is waiting on it. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `OPENQA_API_KEY` and `OPENQA_API_SECRET` must both be set together; setting
 only one is a startup error.
@@ -177,14 +177,13 @@ a temporary file and process it with `jq`, e.g.
 
 | Tool | Description |
 | --- | --- |
-| `restart_jobs` | Restart each of the given jobs. |
+| `restart_jobs` | Restart the given jobs in one bulk request. |
 | `cancel_job` | Cancel a running or scheduled job. |
 | `add_job_comment` | Add a comment to a job. |
 | `trigger_isos` | Trigger ISO test scheduling for a product. |
 | `delete_job` | Delete a job. |
 | `duplicate_job` | Duplicate (clone) a job. |
 | `set_job_priority` | Set the priority of a job. |
-| `restart_jobs_bulk` | Restart several jobs in one bulk request. |
 | `cancel_jobs` | Cancel jobs matching the given filters; at least one filter is required. |
 | `add_group_comment` | Add a comment to a job group. |
 | `add_parent_group_comment` | Add a comment to a parent job group. |
@@ -198,12 +197,13 @@ clients can gate them behind confirmation. To drop them entirely, start the
 server in read-only mode with `--readonly` (or `OPENQA_READONLY=true`): the
 mutating tools are never registered, so clients see only the read tools.
 
-`restart_jobs` restarts each job with a sequential openQA request per id, so
-`job_ids` is capped at 1-50 entries; use `restart_jobs_bulk` (capped at
-1-500, a single bulk request) for larger sets. `trigger_isos`'s `extra` map
-is capped at 100 entries (each becomes a scheduled-product/job-settings row);
-individual values stay unbounded to allow an inline `SCENARIO_DEFINITIONS_YAML`
-document.
+`restart_jobs` sends a single bulk request to openQA regardless of how many
+ids are given, so `job_ids` is capped at 1-500 entries. Partial success (e.g.
+one id missing its assets) is reported by openQA itself in the response's
+`result`/`errors`/`warnings` fields rather than as an MCP error. `trigger_isos`'s
+`extra` map is capped at 100 entries (each becomes a scheduled-product/job-settings
+row); individual values stay unbounded to allow an inline
+`SCENARIO_DEFINITIONS_YAML` document.
 
 ## Running
 

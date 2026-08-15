@@ -12,17 +12,20 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::form::Form;
 use crate::query::{Query, api};
-use crate::server::{OpenQaServer, err, ok, to_result};
-use crate::tools::{MAX_BULK_RESTART_JOBS, MAX_EXTRA_ENTRIES, MAX_RESTART_JOBS, bounded};
+use crate::server::{OpenQaServer, to_result};
+use crate::tools::{MAX_EXTRA_ENTRIES, MAX_RESTART_JOBS, bounded};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RestartJobs {
     #[schemars(length(min = 1, max = MAX_RESTART_JOBS))]
     pub job_ids: Vec<i64>,
+    #[serde(default)]
+    pub force: Option<i64>,
+    #[serde(default)]
+    pub prio: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -60,16 +63,6 @@ pub struct DuplicateJob {
 pub struct SetJobPriority {
     pub job_id: i64,
     pub prio: i64,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RestartJobsBulk {
-    #[schemars(length(min = 1, max = MAX_BULK_RESTART_JOBS))]
-    pub job_ids: Vec<i64>,
-    #[serde(default)]
-    pub force: Option<i64>,
-    #[serde(default)]
-    pub prio: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -162,31 +155,29 @@ fn path_segment(value: &str) -> Result<String, ErrorData> {
 #[tool_router(router = write_tool_router, vis = "pub(crate)")]
 impl OpenQaServer {
     #[tool(
-        description = "Restart each of the given jobs.",
+        description = "Restart the given jobs in one bulk request. Partial success is normal: \
+openQA reports it in the response itself (a `result` map of restarted ids and an optional \
+`errors` list of skipped ones), not as an MCP error.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn restart_jobs(
         &self,
-        Parameters(RestartJobs { job_ids }): Parameters<RestartJobs>,
+        Parameters(RestartJobs {
+            job_ids,
+            force,
+            prio,
+        }): Parameters<RestartJobs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        bounded(
-            "job_ids (use restart_jobs_bulk for larger sets)",
-            job_ids.len(),
-            1,
-            MAX_RESTART_JOBS,
-        )?;
-        let mut results = Vec::with_capacity(job_ids.len());
-        for job_id in job_ids {
-            match self
-                .request_json(&ctx, Method::POST, &api(&format!("jobs/{job_id}/restart")))
-                .await
-            {
-                Ok(v) => results.push(v),
-                Err(e) => return Err(err(e)),
-            }
-        }
-        ok(Value::Array(results))
+        bounded("job_ids", job_ids.len(), 1, MAX_RESTART_JOBS)?;
+        let form = Form::new()
+            .push_all("jobs", &job_ids)
+            .push_opt("force", force)
+            .push_opt("prio", prio);
+        to_result(
+            self.request_form(&ctx, Method::POST, &api("jobs/restart"), &form)
+                .await,
+        )
     }
 
     #[tool(
@@ -330,30 +321,6 @@ impl OpenQaServer {
                 &form,
             )
             .await,
-        )
-    }
-
-    #[tool(
-        description = "Restart several jobs in one bulk request.",
-        annotations(read_only_hint = false, destructive_hint = true)
-    )]
-    async fn restart_jobs_bulk(
-        &self,
-        Parameters(RestartJobsBulk {
-            job_ids,
-            force,
-            prio,
-        }): Parameters<RestartJobsBulk>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        bounded("job_ids", job_ids.len(), 1, MAX_BULK_RESTART_JOBS)?;
-        let form = Form::new()
-            .push_all("jobs", &job_ids)
-            .push_opt("force", force)
-            .push_opt("prio", prio);
-        to_result(
-            self.request_form(&ctx, Method::POST, &api("jobs/restart"), &form)
-                .await,
         )
     }
 
