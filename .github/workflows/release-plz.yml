@@ -40,6 +40,7 @@ jobs:
     permissions:
       id-token: write
       contents: write # assets job (in release.yml) needs to upload assets — caller-capped
+      packages: write # container/container-manifest jobs (in release.yml) push to ghcr.io — caller-capped
     uses: ./.github/workflows/release.yml
     with:
       ref: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
