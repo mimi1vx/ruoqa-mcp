@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.0...v0.3.1) - 2026-08-16
+
+### Added
+
+- add container image for HTTP-transport deployment
+
 ## [0.3.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.2.0...v0.3.0) - 2026-08-15
 
 ### Added
