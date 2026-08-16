@@ -1,0 +1,21 @@
+services:
+  ruoqa-mcp:
+    image: ghcr.io/mimi1vx/ruoqa-mcp:latest
+    # build: .
+    ports:
+      - "8000:8000"
+    environment:
+      OPENQA_SERVER: openqa.example.com
+      OPENQA_MCP_HTTP_TOKEN: ${OPENQA_MCP_HTTP_TOKEN:?set OPENQA_MCP_HTTP_TOKEN}
+      OPENQA_MCP_ALLOWED_HOSTS: ""
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # volumes:
+    #   - ./client.conf:/etc/openqa/client.conf:ro
+    #   # OPENQA_VERIFY replaces the platform trust store, not merges with it.
+    #   - ./ca.pem:/etc/ssl/custom/ca.pem:ro
+    # environment:
+    #   OPENQA_VERIFY: /etc/ssl/custom/ca.pem

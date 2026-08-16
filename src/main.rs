@@ -106,18 +106,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Cancel `ct` on Ctrl-C; a background task so callers can `select!`/await
-/// the server's own completion independently.
-fn cancel_on_ctrl_c(ct: CancellationToken) {
+/// Cancel `ct` on Ctrl-C or, on Unix, SIGTERM; a background task so callers
+/// can `select!`/await the server's own completion independently. SIGTERM
+/// handling matters in a container: this process is PID 1 there, and Linux
+/// discards default-action signals for PID 1 when no handler is installed,
+/// so `docker stop`/`container stop` would otherwise block for the full
+/// timeout and end in SIGKILL instead of the graceful shutdown both
+/// transports already implement.
+fn cancel_on_signal(ct: CancellationToken) {
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            let Ok(mut sigterm) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                let _ = tokio::signal::ctrl_c().await;
+                ct.cancel();
+                return;
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         ct.cancel();
     });
 }
 
 async fn run_stdio(server: OpenQaServer) -> anyhow::Result<()> {
     let ct = CancellationToken::new();
-    cancel_on_ctrl_c(ct.clone());
+    cancel_on_signal(ct.clone());
     // A client may never send `initialize` (e.g. Ctrl-C pressed before any
     // input arrives); race the handshake itself against cancellation too, or
     // this would otherwise ignore Ctrl-C until stdin closes.
@@ -158,7 +180,7 @@ async fn run_http(server: OpenQaServer, auth: HttpAuth, cli: &Cli) -> anyhow::Re
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;
 
-    cancel_on_ctrl_c(ct.clone());
+    cancel_on_signal(ct.clone());
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { ct.cancelled().await })
         .await?;

@@ -32,6 +32,9 @@ cargo build --release
 ./target/release/ruoqa-mcp
 ```
 
+or run the [container image](#container) with Docker/podman — no Rust
+toolchain required.
+
 ## Configuration
 
 The server reads its configuration from environment variables, falling back
@@ -354,6 +357,58 @@ stdio; the read token restricts one HTTP principal while others keep write
 access.
 
 Press `Ctrl-C` to stop; the server shuts down cleanly on both transports.
+
+### Container
+
+The published image (`ghcr.io/mimi1vx/ruoqa-mcp`) is HTTP-only in practice —
+it defaults `OPENQA_MCP_TRANSPORT=http`, binds `0.0.0.0:8000`, and runs as
+`nonroot` on a distroless base with no shell:
+
+```sh
+docker run -e OPENQA_SERVER=openqa.example.com \
+           -e OPENQA_MCP_HTTP_TOKEN=$(openssl rand -hex 32) \
+           -p 8000:8000 ghcr.io/mimi1vx/ruoqa-mcp
+```
+
+Or with the bundled [`compose.yaml`](compose.yaml):
+
+```sh
+OPENQA_MCP_HTTP_TOKEN=$(openssl rand -hex 32) docker compose up
+```
+
+Gotchas specific to the image:
+
+- **No token, no server.** Same rule as any other run: the container exits
+  `1` before binding a port if `OPENQA_MCP_HTTP_TOKEN` /
+  `OPENQA_MCP_HTTP_READ_TOKEN` / `--insecure-no-auth` are all absent. This is
+  the designed fail-closed behaviour, not a bug.
+- **Binding `0.0.0.0` grants no extra `Host` authority.** The image binds wide
+  because loopback-only is useless in a container, but a non-loopback client
+  still needs `OPENQA_MCP_ALLOWED_HOSTS` set to the authority it connects as
+  (see [`Host` allowlist](#host-allowlist)).
+- **Credentials:** mount a `client.conf` at `/etc/openqa/client.conf` (works
+  regardless of `HOME`) or pass `OPENQA_API_KEY` + `OPENQA_API_SECRET`
+  **together** — setting only one is a startup error:
+
+  ```sh
+  docker run -v ./client.conf:/etc/openqa/client.conf:ro \
+             -e OPENQA_MCP_HTTP_TOKEN=... -p 8000:8000 \
+             ghcr.io/mimi1vx/ruoqa-mcp
+  ```
+- **`OPENQA_VERIFY=/path/ca.pem` replaces the platform trust store**, it does
+  not merge with it — mount the CA bundle read-only alongside `client.conf`
+  and point the variable at the in-container path:
+
+  ```sh
+  docker run -v ./ca.pem:/etc/ssl/custom/ca.pem:ro \
+             -e OPENQA_VERIFY=/etc/ssl/custom/ca.pem \
+             -e OPENQA_MCP_HTTP_TOKEN=... -p 8000:8000 \
+             ghcr.io/mimi1vx/ruoqa-mcp
+  ```
+
+There is no `/health` endpoint or `HEALTHCHECK` (the distroless base has no
+shell or curl to run one); orchestrators should use a TCP check or an
+authenticated `GET /mcp` from outside the container.
 
 ## Development
 
