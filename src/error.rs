@@ -17,17 +17,12 @@ const BODY_PREVIEW_BYTES: usize = 512;
 pub(crate) fn classify(e: ruoqa::Error) -> Result<CallToolResult, ErrorData> {
     let message = e.to_string();
     match e {
-        ruoqa::Error::Request { status, body, .. } => {
-            let kind = match status.as_u16() {
-                401 => "unauthorized",
-                403 => "forbidden",
-                404 => "not_found",
-                429 => "rate_limited",
-                400..=499 => "bad_request",
-                _ => "server_error",
-            };
-            tool_error(kind, Some(status.as_u16()), message, Some(&body))
-        }
+        ruoqa::Error::Request { status, body, .. } => tool_error(
+            status_kind(status.as_u16()),
+            Some(status.as_u16()),
+            message,
+            Some(&body),
+        ),
         ruoqa::Error::Connection { .. } => tool_error("connection", None, message, None),
         ruoqa::Error::DeadlineExceeded { .. } => tool_error("timeout", None, message, None),
         ruoqa::Error::BodyTooLarge { .. } => tool_error("response_too_large", None, message, None),
@@ -39,6 +34,20 @@ pub(crate) fn classify(e: ruoqa::Error) -> Result<CallToolResult, ErrorData> {
         // mean this deployment is wired wrong or refused to send the
         // request. No caller can act on them.
         _ => Err(ErrorData::internal_error(message, None)),
+    }
+}
+
+/// Classify an HTTP status into the same `kind` vocabulary
+/// [`classify`] uses for `ruoqa::Error::Request`. Shared with
+/// `tools::artifact`, which maps status codes from raw (non-ruoqa) responses.
+pub(crate) fn status_kind(status: u16) -> &'static str {
+    match status {
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not_found",
+        429 => "rate_limited",
+        400..=499 => "bad_request",
+        _ => "server_error",
     }
 }
 

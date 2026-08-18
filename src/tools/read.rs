@@ -1,4 +1,5 @@
-//! The 25 read tools (port of the READ section of `server.py`).
+//! The 28 read tools (port of the READ section of `server.py`, plus the job-
+//! log-artifact tools that have no equivalent there).
 
 use reqwest::Method;
 use rmcp::handler::server::wrapper::Parameters;
@@ -7,12 +8,14 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::error::classify;
 use crate::query::{Query, api};
-use crate::server::{OpenQaServer, to_result};
+use crate::server::{OpenQaServer, ok, to_result};
 use crate::summary::summarize_jobs;
-use crate::tools::{MAX_IDS, bounded};
+use crate::tools::artifact;
+use crate::tools::{MAX_ARCHIVE_MEMBERS, MAX_ARTIFACT_BYTES, MAX_IDS, PROBE_BYTES, bounded};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListJobsArgs {
@@ -136,6 +139,44 @@ pub struct ScheduledProductId {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ParentGroupId {
     pub parent_group_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JobLogFile {
+    pub job_id: i64,
+    pub filename: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetJobLog {
+    pub job_id: i64,
+    pub filename: String,
+    /// A path inside a tar/tar.gz/tar.xz archive to extract, from
+    /// `list_job_log_members`. Required when `filename` is such an archive.
+    #[serde(default)]
+    pub member: Option<String>,
+    /// Lowers the response-size ceiling; never raises it above the server's
+    /// own limit.
+    #[serde(default)]
+    #[schemars(range(max = MAX_ARTIFACT_BYTES))]
+    pub max_bytes: Option<usize>,
+    /// Return only the last N lines. For a plain-text file with no
+    /// `member`, this is served by a byte-ranged request instead of a full
+    /// download.
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
+    /// A regex; only matching lines (plus `context_lines` of surrounding
+    /// context) are returned, as `matches` instead of `content`.
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// Lines of context to include around each `grep` match. Ignored
+    /// without `grep`.
+    #[serde(default)]
+    pub context_lines: Option<usize>,
+    /// Caps how many matching lines `grep` expands into context; the true
+    /// count is still reported as `total_matches`. Ignored without `grep`.
+    #[serde(default)]
+    pub max_matches: Option<usize>,
 }
 
 /// Pull the `jobs` array a summary is built from, rejecting any shape other
@@ -591,5 +632,237 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
             )
             .await,
         )
+    }
+
+    #[tool(
+        description = "List a job's downloadable log files and uploaded (ulog) files, e.g. \
+autoinst-log.txt or a supportconfig .txz. Pass a name to `get_job_log`, or to \
+`list_job_log_members` first if it looks like an archive.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_job_logs(
+        &self,
+        Parameters(JobId { job_id }): Parameters<JobId>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ajax_path = format!("/tests/{job_id}/downloads_ajax");
+        if let Ok(Value::String(html)) = self.request_json(&ctx, Method::GET, &ajax_path).await {
+            let files = artifact::parse_downloads(&html, job_id);
+            if !files.is_empty() {
+                return ok(json!({"source": "downloads_ajax", "files": files}));
+            }
+        }
+        match self
+            .request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/details")))
+            .await
+        {
+            Ok(value) => ok(json!({
+                "source": "details",
+                "files": artifact::details_logs(&value),
+            })),
+            Err(e) => classify(e),
+        }
+    }
+
+    #[tool(
+        description = "List the members of a job log archive (tar, tar.gz, or tar.xz), e.g. \
+the files inside a supportconfig .txz. Pass one entry's `path` as `member` to `get_job_log`.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_job_log_members(
+        &self,
+        Parameters(JobLogFile { job_id, filename }): Parameters<JobLogFile>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        artifact::validate_filename(&filename)?;
+        let probe = match artifact::probe(
+            &self.client,
+            &ctx,
+            job_id,
+            &filename,
+            PROBE_BYTES,
+            MAX_ARTIFACT_BYTES,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(bail) => return bail,
+        };
+        let content = match artifact::fetch_decoded(
+            &self.client,
+            &ctx,
+            job_id,
+            &filename,
+            &probe,
+            MAX_ARTIFACT_BYTES,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(bail) => return bail,
+        };
+        match artifact::tar_members(&content, MAX_ARCHIVE_MEMBERS) {
+            Ok((members, truncated)) => ok(json!({"members": members, "truncated": truncated})),
+            Err(bail) => bail,
+        }
+    }
+
+    #[tool(
+        description = "Read a job log or uploaded file. For a large plain-text log, pass \
+`tail_lines` to fetch only the end of it (a byte-ranged request, not a full download); pass \
+`grep` (a regex, with `context_lines` around each match) to search it instead of returning \
+the whole thing. Archives (tar, tar.gz, tar.xz) are decoded automatically — pass `member` \
+(from `list_job_log_members`) to read one entry. Binary artifacts (images, videos) are \
+refused with an `unsupported_media` error.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_job_log(
+        &self,
+        Parameters(GetJobLog {
+            job_id,
+            filename,
+            member,
+            max_bytes,
+            tail_lines,
+            grep,
+            context_lines,
+            max_matches,
+        }): Parameters<GetJobLog>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        artifact::validate_filename(&filename)?;
+        if let Some(member) = &member {
+            artifact::validate_member(member)?;
+        }
+        let ceiling = max_bytes.map_or(MAX_ARTIFACT_BYTES, |m| m.min(MAX_ARTIFACT_BYTES));
+        let context_lines = context_lines.unwrap_or(0);
+        let max_matches = max_matches.unwrap_or(artifact::DEFAULT_MAX_MATCHES);
+
+        let probe = match artifact::probe(
+            &self.client,
+            &ctx,
+            job_id,
+            &filename,
+            PROBE_BYTES,
+            ceiling,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(bail) => return bail,
+        };
+        let needs_full_decode =
+            member.is_some() || artifact::sniff(&probe.body) != artifact::Sniff::Plain;
+
+        let (raw_text, transferred, size, changed_during_read) = if needs_full_decode {
+            let content = match artifact::fetch_decoded(
+                &self.client,
+                &ctx,
+                job_id,
+                &filename,
+                &probe,
+                ceiling,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(bail) => return bail,
+            };
+            let final_bytes = if let Some(member) = &member {
+                match artifact::extract_tar_member(&content, member, ceiling) {
+                    Ok(b) => b,
+                    Err(bail) => return bail,
+                }
+            } else if artifact::sniff(&content) == artifact::Sniff::Tar {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "{filename:?} is an archive; pass `member` (see list_job_log_members) to read one entry"
+                    ),
+                    None,
+                ));
+            } else {
+                content
+            };
+            let len = final_bytes.len() as u64;
+            let Ok(text) = String::from_utf8(final_bytes) else {
+                return artifact::unsupported_media(&probe.url, len);
+            };
+            (text, len, probe.size.map_or(len, |s| s.max(len)), false)
+        } else {
+            match tail_lines {
+                Some(n) if !probe.complete => {
+                    let window = artifact::tail_window(n, probe.size, ceiling as u64);
+                    let tail = match artifact::fetch_tail(
+                        &self.client,
+                        &ctx,
+                        job_id,
+                        &filename,
+                        &probe,
+                        window,
+                        ceiling,
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(bail) => return bail,
+                    };
+                    let len = tail.bytes.len() as u64;
+                    let Ok(text) = String::from_utf8(tail.bytes) else {
+                        return artifact::unsupported_media(&probe.url, len);
+                    };
+                    let text = artifact::drop_partial_first_line(&text).to_string();
+                    (
+                        text,
+                        len,
+                        probe.size.unwrap_or(len),
+                        tail.changed_during_read,
+                    )
+                }
+                _ => {
+                    let raw = if probe.complete {
+                        probe.body.clone()
+                    } else {
+                        match artifact::fetch_all(&self.client, &ctx, job_id, &filename, ceiling)
+                            .await
+                        {
+                            Ok(b) => b,
+                            Err(bail) => return bail,
+                        }
+                    };
+                    let len = raw.len() as u64;
+                    let Ok(text) = String::from_utf8(raw) else {
+                        return artifact::unsupported_media(&probe.url, len);
+                    };
+                    (text, len, probe.size.unwrap_or(len), false)
+                }
+            }
+        };
+
+        let mut reply = json!({"filename": filename});
+        if let Some(member) = &member {
+            reply["member"] = json!(member);
+        }
+        match artifact::slice(
+            &raw_text,
+            tail_lines,
+            grep.as_deref(),
+            context_lines,
+            max_matches,
+        )? {
+            artifact::Sliced::Text(content) => {
+                reply["bytes"] = json!(transferred);
+                reply["size"] = json!(size);
+                reply["content"] = json!(content);
+                if changed_during_read {
+                    reply["changed_during_read"] = json!(true);
+                }
+            }
+            artifact::Sliced::Matches(m) => {
+                reply["matches"] = json!(m.hits);
+                reply["total_matches"] = json!(m.total);
+                reply["truncated"] = json!(m.truncated);
+            }
+        }
+        ok(reply)
     }
 }

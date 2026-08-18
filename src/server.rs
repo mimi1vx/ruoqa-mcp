@@ -256,6 +256,9 @@ mod router_tests {
         "get_iso_job_stats",
         "list_group_comments",
         "list_parent_group_comments",
+        "list_job_logs",
+        "list_job_log_members",
+        "get_job_log",
     ];
 
     // Matches the README's "Mutating tools" table exactly.
@@ -286,7 +289,7 @@ mod router_tests {
 
     #[test]
     fn read_router_matches_readme_table() {
-        assert_eq!(READ_TOOL_NAMES.len(), 25);
+        assert_eq!(READ_TOOL_NAMES.len(), 28);
         let expected: BTreeSet<String> = READ_TOOL_NAMES
             .iter()
             .map(std::string::ToString::to_string)
@@ -307,7 +310,7 @@ mod router_tests {
     #[test]
     fn readonly_excludes_write_tools() {
         let full = OpenQaServer::read_tool_router() + OpenQaServer::write_tool_router();
-        assert_eq!(full.list_all().len(), 39);
+        assert_eq!(full.list_all().len(), 42);
     }
 
     // The scope gate reads `read_only_hint`, so an unannotated (or inverted)

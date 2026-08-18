@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod read;
 pub mod write;
 
@@ -11,6 +12,17 @@ pub(crate) const MAX_RESTART_JOBS: usize = 500;
 /// `trigger_isos.extra`: each entry becomes a scheduled-product/job-settings
 /// row; entry *values* stay unbounded (e.g. inline `SCENARIO_DEFINITIONS_YAML`).
 pub(crate) const MAX_EXTRA_ENTRIES: usize = 100;
+
+/// Ceiling on both a raw artifact download and its decompressed output.
+/// Matches ruoqa's own `max_response_bytes` default; re-imposed here because
+/// `Client::send_raw`/`execute` bypass that cap entirely.
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
+/// Cap on how many entries `list_job_log_members` reports from one tar
+/// archive, so a hostile or huge archive can't produce an unbounded reply.
+pub(crate) const MAX_ARCHIVE_MEMBERS: usize = 5000;
+/// Bytes read by the initial `Range: bytes=0-511` probe: enough to sniff
+/// gzip/xz/tar magic bytes and, on a 206, learn the artifact's total size.
+pub(crate) const PROBE_BYTES: u64 = 512;
 
 /// Reject `len` outside `[min, max]` with a message naming `field`, the
 /// observed count, and the limit that was crossed.

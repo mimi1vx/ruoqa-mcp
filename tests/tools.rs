@@ -10,7 +10,7 @@ use rmcp::{RoleClient, ServiceExt};
 use ruoqa_mcp::OpenQaServer;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 async fn server_with_mock(mock: &MockServer, readonly: bool) -> RunningService<RoleClient, ()> {
     server_with_client(mock, readonly, None, None).await
@@ -984,4 +984,524 @@ async fn readonly_server_does_not_expose_mutating_tools() {
         .expect_err("readonly server has no write tools");
 
     assert!(matches!(err, rmcp::ServiceError::McpError(_)));
+}
+
+// --- Job-artifact tools -----------------------------------------------
+
+/// Parses a `Range: bytes=<start>-<end>` header value the way this crate's
+/// `insert_range` builds it (either half may be absent).
+fn parse_range(header: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let rest = header.strip_prefix("bytes=")?;
+    let (start, end) = rest.split_once('-')?;
+    let start = if start.is_empty() {
+        None
+    } else {
+        start.parse().ok()
+    };
+    let end = if end.is_empty() {
+        None
+    } else {
+        end.parse().ok()
+    };
+    Some((start, end))
+}
+
+/// A fake `Mojolicious::Static`-style file server, replicating its Range
+/// handling *including* the documented suffix-range bug (a `bytes=-N`
+/// request is parsed as `start=None, end=N`, returning the head labelled as
+/// a 206 tail) — so a regression that reintroduces a suffix-range tail
+/// fetch is caught by wrong *content*, not just a header assertion.
+/// `etags` cycles the `ETag` returned across successive calls (clamped to
+/// its last entry), for the "log changed mid-read" test.
+struct RangedFile {
+    body: Vec<u8>,
+    etags: Vec<&'static str>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl RangedFile {
+    fn fixed(body: Vec<u8>, etag: &'static str) -> Self {
+        Self {
+            body,
+            etags: vec![etag],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn changing(body: Vec<u8>, etags: Vec<&'static str>) -> Self {
+        Self {
+            body,
+            etags,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let etag = self.etags[call.min(self.etags.len() - 1)];
+        let total = self.body.len();
+        let Some(range) = req.headers.get("range").and_then(|v| v.to_str().ok()) else {
+            return ResponseTemplate::new(200).set_body_bytes(self.body.clone());
+        };
+        let Some((start, end)) = parse_range(range) else {
+            return ResponseTemplate::new(200).set_body_bytes(self.body.clone());
+        };
+        let start = start.unwrap_or(0);
+        let end = end.filter(|&e| e < total).unwrap_or(total - 1);
+        if start > end {
+            return ResponseTemplate::new(416);
+        }
+        ResponseTemplate::new(206)
+            .set_body_bytes(self.body[start..=end].to_vec())
+            .insert_header("content-range", format!("bytes {start}-{end}/{total}"))
+            .insert_header("etag", etag)
+    }
+}
+
+fn numbered_lines(n: usize) -> String {
+    use std::fmt::Write as _;
+    (0..n).fold(String::new(), |mut acc, i| {
+        let _ = writeln!(acc, "line{i:04}");
+        acc
+    })
+}
+
+#[tokio::test]
+async fn get_job_log_plain_text_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tests/7/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello world\n"))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 7, "filename": "autoinst-log.txt"}),
+    )
+    .await
+    .expect("call_tool");
+
+    let value = text(&result);
+    assert_eq!(value["filename"], "autoinst-log.txt");
+    assert_eq!(value["content"], "hello world\n");
+}
+
+#[tokio::test]
+async fn get_job_log_tail_uses_absolute_range_and_returns_the_tail() {
+    let mock = MockServer::start().await;
+    let body = numbered_lines(1000).into_bytes();
+    assert_eq!(body.len(), 9000);
+    let file = std::sync::Arc::new(RangedFile::fixed(body, "etag-1"));
+    let responder = {
+        let file = file.clone();
+        move |req: &Request| file.respond(req)
+    };
+    Mock::given(method("GET"))
+        .and(path("/tests/7/file/autoinst-log.txt"))
+        .respond_with(responder)
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 7, "filename": "autoinst-log.txt", "tail_lines": 5}),
+    )
+    .await
+    .expect("call_tool");
+
+    let expected = (995..1000)
+        .map(|i| format!("line{i:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text(&result)["content"], expected);
+
+    let requests = mock.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2, "expected a probe then one tail request");
+    let tail_range = requests[1].headers.get("range").unwrap().to_str().unwrap();
+    assert!(
+        tail_range.starts_with("bytes=") && !tail_range.contains("bytes=-"),
+        "tail must use an absolute range, never a suffix range: {tail_range}"
+    );
+    assert!(
+        requests.iter().all(|r| !r.headers.contains_key("referer")),
+        "must never send a Referer to /tests/*"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_server_ignoring_range_is_still_correct() {
+    let mock = MockServer::start().await;
+    let body = numbered_lines(10);
+    Mock::given(method("GET"))
+        .and(path("/tests/9/file/small.log"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 9, "filename": "small.log", "tail_lines": 3}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(text(&result)["content"], "line0007\nline0008\nline0009");
+    let requests = mock.received_requests().await.expect("requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 200 response already is the whole file"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_tail_reports_etag_change_after_one_retry() {
+    let mock = MockServer::start().await;
+    let body = numbered_lines(1000).into_bytes();
+    let file = std::sync::Arc::new(RangedFile::changing(body, vec!["v1", "v2"]));
+    let responder = {
+        let file = file.clone();
+        move |req: &Request| file.respond(req)
+    };
+    Mock::given(method("GET"))
+        .and(path("/tests/7/file/autoinst-log.txt"))
+        .respond_with(responder)
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 7, "filename": "autoinst-log.txt", "tail_lines": 5}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(text(&result)["changed_during_read"], true);
+    let requests = mock.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 3, "probe + first tail attempt + one retry");
+}
+
+#[tokio::test]
+async fn get_job_log_decodes_gzip() {
+    let mock = MockServer::start().await;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, b"decoded gzip content\n").unwrap();
+    let gz = encoder.finish().unwrap();
+    Mock::given(method("GET"))
+        .and(path("/tests/3/file/y2logs.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(gz))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 3, "filename": "y2logs.tar.gz"}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(text(&result)["content"], "decoded gzip content\n");
+}
+
+fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut bytes);
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn get_job_log_extracts_tar_xz_member() {
+    let mock = MockServer::start().await;
+    let tar_bytes = build_tar(&[("logs/inner.txt", b"member contents")]);
+    let mut xz_bytes = Vec::new();
+    lzma_rs::xz_compress(&mut &tar_bytes[..], &mut xz_bytes).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/tests/4/file/logs.tar.xz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(xz_bytes))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 4, "filename": "logs.tar.xz", "member": "logs/inner.txt"}),
+    )
+    .await
+    .expect("call_tool");
+
+    let value = text(&result);
+    assert_eq!(value["content"], "member contents");
+    assert_eq!(value["member"], "logs/inner.txt");
+}
+
+#[tokio::test]
+async fn list_job_log_members_lists_tar_entries() {
+    let mock = MockServer::start().await;
+    let tar_bytes = build_tar(&[("a.txt", b"aaa"), ("b.txt", b"bb")]);
+    Mock::given(method("GET"))
+        .and(path("/tests/4/file/logs.tar"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar_bytes))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "list_job_log_members",
+        json!({"job_id": 4, "filename": "logs.tar"}),
+    )
+    .await
+    .expect("call_tool");
+
+    let value = text(&result);
+    let members = value["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["path"], "a.txt");
+    assert_eq!(members[0]["size"], 3);
+    assert_eq!(value["truncated"], false);
+}
+
+#[tokio::test]
+async fn get_job_log_binary_content_is_unsupported_media() {
+    let mock = MockServer::start().await;
+    let mut body = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    body.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01, 0xFF]);
+    Mock::given(method("GET"))
+        .and(path("/tests/2/file/video.ogv"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 2, "filename": "video.ogv"}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "unsupported_media");
+}
+
+#[tokio::test]
+async fn get_job_log_oversized_body_is_response_too_large() {
+    let mock = MockServer::start().await;
+    let body = "x".repeat(500);
+    Mock::given(method("GET"))
+        .and(path("/tests/5/file/big.log"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 5, "filename": "big.log", "max_bytes": 100}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "response_too_large");
+}
+
+#[tokio::test]
+async fn get_job_log_gzip_bomb_is_response_too_large() {
+    let mock = MockServer::start().await;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    std::io::Write::write_all(&mut encoder, &vec![0u8; 10 * 1024 * 1024]).unwrap();
+    let gz = encoder.finish().unwrap();
+    let ceiling = 1024 * 1024;
+    assert!(
+        gz.len() < ceiling,
+        "compressed bomb must still fit under the ceiling raw"
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/tests/6/file/bomb.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(gz))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 6, "filename": "bomb.gz", "max_bytes": ceiling}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "response_too_large");
+}
+
+#[tokio::test]
+async fn get_job_log_404_is_not_found() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tests/1/file/missing.txt"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 1, "filename": "missing.txt"}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "not_found");
+}
+
+#[tokio::test]
+async fn get_job_log_filename_with_slash_is_rejected() {
+    let mock = MockServer::start().await;
+    let client = server_with_mock(&mock, true).await;
+
+    let err = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 1, "filename": "a/b.txt"}),
+    )
+    .await
+    .expect_err("filename with a slash must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(mock.received_requests().await.expect("requests").is_empty());
+}
+
+#[tokio::test]
+async fn get_job_log_grep_returns_matches_with_context() {
+    let mock = MockServer::start().await;
+    let body = "one\ntwo\nERROR: boom\nfour\nfive\n";
+    Mock::given(method("GET"))
+        .and(path("/tests/8/file/log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 8, "filename": "log.txt", "grep": "ERROR", "context_lines": 1}),
+    )
+    .await
+    .expect("call_tool");
+
+    let value = text(&result);
+    assert_eq!(value["total_matches"], 1);
+    let matches = value["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 3);
+    assert_eq!(matches[1]["text"], "ERROR: boom");
+}
+
+#[tokio::test]
+async fn list_job_logs_parses_downloads_ajax() {
+    let mock = MockServer::start().await;
+    let html = r#"<a href="/tests/11/file/autoinst-log.txt">autoinst-log.txt</a>
+        <h2>Uploaded logs</h2>
+        <a href="/tests/11/file/my_custom.log">my_custom.log</a>"#;
+    Mock::given(method("GET"))
+        .and(path("/tests/11/downloads_ajax"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(html))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "list_job_logs", json!({"job_id": 11}))
+        .await
+        .expect("call_tool");
+
+    let value = text(&result);
+    assert_eq!(value["source"], "downloads_ajax");
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["kind"], "result");
+    assert_eq!(files[1]["kind"], "ulog");
+}
+
+#[tokio::test]
+async fn list_job_logs_falls_back_to_details_on_404() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tests/12/downloads_ajax"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/12/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": ["autoinst-log.txt"],
+            "ulogs": ["my_custom.log"],
+        })))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "list_job_logs", json!({"job_id": 12}))
+        .await
+        .expect("call_tool");
+
+    let value = text(&result);
+    assert_eq!(value["source"], "details");
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+}
+
+#[tokio::test]
+async fn list_job_logs_falls_back_to_details_when_ajax_parse_is_empty() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tests/13/downloads_ajax"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<p>no files here</p>"))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/13/details"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"logs": ["a.txt"], "ulogs": []})),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "list_job_logs", json!({"job_id": 13}))
+        .await
+        .expect("call_tool");
+
+    assert_eq!(text(&result)["source"], "details");
 }

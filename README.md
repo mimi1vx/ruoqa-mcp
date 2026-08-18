@@ -148,6 +148,9 @@ tools get `403`).
 | `get_iso_job_stats` | Get job statistics for scheduled products. |
 | `list_group_comments` | List comments on a job group. |
 | `list_parent_group_comments` | List comments on a parent job group. |
+| `list_job_logs` | List a job's downloadable log files and uploaded (ulog) files. |
+| `list_job_log_members` | List the members of a job log archive (tar, tar.gz, tar.xz). |
+| `get_job_log` | Read a job log or uploaded file, optionally tailed, grepped, or extracted from an archive. |
 
 `list_jobs` and `list_jobs_overview` accept the same optional filters:
 `state`, `result`, `distri`, `version`, `build`, `test`, `arch`, `machine`,
@@ -175,6 +178,24 @@ Jobs bucket by `result`; in-progress jobs (result `none`) bucket by `state`
 (e.g. `running`, `scheduled`). To work with the full data instead, save it to
 a temporary file and process it with `jq`, e.g.
 `jq '.jobs[] | select(.result=="failed")'`.
+
+#### Job artifacts
+
+`list_job_logs`, `list_job_log_members`, and `get_job_log` reach
+`GET /tests/<id>/file/<filename>` and `/tests/<id>/downloads_ajax`, not
+`/api/v1/`: openQA serves job logs and uploaded (`ulogs`) files from a plain
+`Mojolicious::Static` route, both flat regardless of whether the file is a
+built-in result file or an uploaded log. `list_job_logs` prefers the small
+`downloads_ajax` fragment and falls back to the ~14 MB `jobs/<id>/details`
+response if that route is unavailable or parses empty; the reply's `source`
+field says which one answered. `get_job_log`'s `tail_lines` is served by an
+absolute byte range (`bytes=<start>-`), never a suffix range
+(`bytes=-<n>`): openQA's `Mojolicious::Static` mishandles the latter,
+returning the *head* of the file labelled as a 206 tail. Both the raw
+download and any decompressed archive content are bounded by a 32 MiB
+ceiling (`max_bytes` may lower it, never raise it); a binary artifact (e.g.
+a video) is refused as `unsupported_media` rather than returned as mangled
+text.
 
 ### Mutating tools (require credentials)
 
@@ -218,7 +239,9 @@ A tool call fails one of two ways:
   `{"error": {"kind", "status"?, "message", "body"?}}`. `body` is openQA's
   response body, truncated to 512 bytes. `kind` is one of: `unauthorized`,
   `forbidden`, `not_found`, `rate_limited`, `bad_request`, `server_error`,
-  `connection`, `timeout`, `response_too_large`, `invalid_response`.
+  `connection`, `timeout`, `response_too_large`, `invalid_response`,
+  `unsupported_media` (a `get_job_log` artifact that isn't text, e.g. a
+  video or image).
 - **The server itself is misconfigured or refused to route the request**
   (bad `client.conf`, TLS setup failure, incomplete credentials, a
   cross-origin or outside-base-URL request). This is a JSON-RPC
@@ -274,8 +297,8 @@ authentication is mandatory and deny-by-default. Two tokens define two scopes:
 
 | Token | Scope | Tools |
 | --- | --- | --- |
-| `OPENQA_MCP_HTTP_TOKEN` | write | all 39 read + mutating tools |
-| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 25 read tools only |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 42 read + mutating tools |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 28 read tools only |
 
 Either may be set alone. A read-scope caller sees only the read tools in
 `tools/list` and gets an MCP error — with no openQA request made — if it calls a
