@@ -195,7 +195,12 @@ returning the *head* of the file labelled as a 206 tail. Both the raw
 download and any decompressed archive content are bounded by a 32 MiB
 ceiling (`max_bytes` may lower it, never raise it); a binary artifact (e.g.
 a video) is refused as `unsupported_media` rather than returned as mangled
-text.
+text. `list_job_logs` intentionally covers logs and `ulogs` only, returning
+just `name` and `kind` (`result` or `ulog`) per entry — it does not surface
+assets (`/tests/<id>/asset/…`), sizes, or URLs, so its listing is not an
+exhaustive artifact inventory; note that `video.webm` classes as
+`kind: "result"`, since it comes from the results section rather than the
+"Uploaded logs" heading `list_job_logs` splits on.
 
 ### Mutating tools (require credentials)
 
