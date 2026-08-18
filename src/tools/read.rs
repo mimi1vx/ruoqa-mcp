@@ -808,7 +808,8 @@ refused with an `unsupported_media` error.",
                     };
                     let len = tail.bytes.len() as u64;
                     let Ok(text) = String::from_utf8(tail.bytes) else {
-                        return artifact::unsupported_media(&probe.url, len);
+                        // `len` is the tail window, not the file: report the probe's total.
+                        return artifact::unsupported_media(&probe.url, probe.size.unwrap_or(len));
                     };
                     let text = artifact::drop_partial_first_line(&text).to_string();
                     (
