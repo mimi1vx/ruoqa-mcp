@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.1...v0.3.2) - 2026-08-18
+
+### Added
+
+- add job-log-artifact tools (list_job_logs, list_job_log_members, get_job_log)
+
+### Other
+
+- fix cargo-deny warnings and update dependencies
+- bump h2 to 0.4.16, fixing RUSTSEC-2026-0258
+
 ## [0.3.1](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.0...v0.3.1) - 2026-08-16
 
 ### Added
