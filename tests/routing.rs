@@ -1,4 +1,4 @@
-//! Table-driven request-shape check for all 39 registered tools: method,
+//! Table-driven request-shape check for all 42 registered tools: method,
 //! path, query string, and body/form-encoding. `tests/tools.rs` asserts
 //! response handling and edge cases; this file asserts only where and how
 //! each tool's request goes out, so a typo'd `format!` path or a `GET` where
@@ -62,7 +62,7 @@ struct Case {
 #[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
-        // --- Read tools: all GET, all body-less (25) ---
+        // --- Read tools: all GET, all body-less (28) ---
         Case {
             tool: "list_jobs",
             args: json!({"state": "done"}),
@@ -269,6 +269,26 @@ fn cases() -> Vec<Case> {
             query: "",
             body: None,
         },
+        // `list_job_logs` is covered separately below (see
+        // `list_job_logs_requests_downloads_ajax_first`): its conditional
+        // fallback to `/details` means it doesn't fit this matrix's
+        // exactly-one-request assumption against the shared any() mock.
+        Case {
+            tool: "list_job_log_members",
+            args: json!({"job_id": 7, "filename": "y2logs.tar.xz"}),
+            method: "GET",
+            path: "/tests/7/file/y2logs.tar.xz",
+            query: "",
+            body: None,
+        },
+        Case {
+            tool: "get_job_log",
+            args: json!({"job_id": 7, "filename": "autoinst-log.txt"}),
+            method: "GET",
+            path: "/tests/7/file/autoinst-log.txt",
+            query: "",
+            body: None,
+        },
         // --- Mutating tools (14) ---
         Case {
             tool: "restart_jobs",
@@ -390,9 +410,21 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Names covered by [`cases`], for the coverage-ratchet guard test below.
+/// Tools whose request shape is verified by a dedicated test below instead
+/// of the shared matrix: `list_job_logs` conditionally issues a *second*
+/// request (falling back to `/details`) whenever the first response isn't
+/// recognizable HTML, which the shared `any()` mock never produces, so it
+/// can't satisfy this file's exactly-one-request-per-case assumption.
+const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs"];
+
+/// Names covered by [`cases`] plus [`COVERED_OUTSIDE_MATRIX`], for the
+/// coverage-ratchet guard test below.
 fn case_names() -> BTreeSet<&'static str> {
-    cases().iter().map(|c| c.tool).collect()
+    cases()
+        .iter()
+        .map(|c| c.tool)
+        .chain(COVERED_OUTSIDE_MATRIX.iter().copied())
+        .collect()
 }
 
 #[tokio::test]
@@ -514,4 +546,23 @@ async fn matrix_covers_exactly_the_registered_tools() {
         "routing matrix out of sync with the registered tools: missing from matrix {missing:?}, \
          stale in matrix {stale:?}"
     );
+}
+
+/// `list_job_logs`'s first request always targets `downloads_ajax`,
+/// regardless of whether a fallback to `/details` follows.
+#[tokio::test]
+async fn list_job_logs_requests_downloads_ajax_first() {
+    let mock = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&mock)
+        .await;
+    let client = run_server(&mock).await;
+
+    call(&client, "list_job_logs", &json!({"job_id": 42})).await;
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let first = requests.first().expect("at least one request");
+    assert_eq!(first.method.as_str(), "GET");
+    assert_eq!(first.url.path(), "/tests/42/downloads_ajax");
 }
