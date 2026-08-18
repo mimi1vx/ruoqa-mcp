@@ -1308,6 +1308,45 @@ async fn get_job_log_binary_content_is_unsupported_media() {
 }
 
 #[tokio::test]
+async fn get_job_log_tail_of_binary_reports_the_total_size() {
+    let mock = MockServer::start().await;
+    let mut body = vec![0x1A, 0x45, 0xDF, 0xA3];
+    body.extend(std::iter::repeat_n(0xFFu8, 20_000 - body.len()));
+    let file = std::sync::Arc::new(RangedFile::fixed(body, "etag-1"));
+    let responder = {
+        let file = file.clone();
+        move |req: &Request| file.respond(req)
+    };
+    Mock::given(method("GET"))
+        .and(path("/tests/6/file/video.webm"))
+        .respond_with(responder)
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log",
+        json!({"job_id": 6, "filename": "video.webm", "tail_lines": 5}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    let value = text(&result);
+    assert_eq!(value["error"]["kind"], "unsupported_media");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("20000"),
+        "message should report the artefact total: {message}"
+    );
+    assert!(
+        !message.contains("8192"),
+        "message must not report the tail window: {message}"
+    );
+}
+
+#[tokio::test]
 async fn get_job_log_oversized_body_is_response_too_large() {
     let mock = MockServer::start().await;
     let body = "x".repeat(500);
