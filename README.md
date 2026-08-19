@@ -151,6 +151,7 @@ tools get `403`).
 | `list_job_logs` | List a job's downloadable log files and uploaded (ulog) files. |
 | `list_job_log_members` | List the members of a job log archive (tar, tar.gz, tar.xz). |
 | `get_job_log` | Read a job log or uploaded file, optionally tailed, grepped, or extracted from an archive. |
+| `get_job_log_errors` | Digest a job's logs down to the failure signal: the first matching tier of `serial_terminal.txt` TFAIL/TBROK, `autoinst-log.txt` "Test died", a generic fallback, or the tail — plus the failing module(s) with `#step` deep links. |
 
 `list_jobs` and `list_jobs_overview` accept the same optional filters:
 `state`, `result`, `distri`, `version`, `build`, `test`, `arch`, `machine`,
@@ -201,6 +202,25 @@ assets (`/tests/<id>/asset/…`), sizes, or URLs, so its listing is not an
 exhaustive artifact inventory; note that `video.webm` classes as
 `kind: "result"`, since it comes from the results section rather than the
 "Uploaded logs" heading `list_job_logs` splits on.
+
+`get_job_log_errors` collapses "which log, and what in it" into one call by
+checking, in priority order, `serial_terminal.txt` for LTP/TAP-style
+`TFAIL`/`TBROK` (the actual verdict for serial-console-driven frameworks,
+never duplicated into `autoinst-log.txt`), then `autoinst-log.txt` for
+"Test died", then a generic error/timeout fallback, then just the last 30
+lines — the first tier that matches wins, and each reply is bounded to a
+fixed line budget regardless of the log's size. `serial_terminal.txt` is
+probed first (and only) because it is where a real product-assertion
+failure shows up for those frameworks; a job that never wrote one (checked
+via `/details`) skips the probe entirely rather than costing a 404. Unlike
+`get_job_log`, a non-UTF-8 byte is decoded lossily instead of refused as
+`unsupported_media` — `serial_terminal.txt` is raw console output that
+routinely carries stray non-UTF-8 bytes, exactly the jobs this tier exists
+for. Pass `markers` (a list of regexes) to scan `filename` (default
+`autoinst-log.txt`) for something else entirely instead of the tier chain.
+The tool also fetches `/api/v1/jobs/<id>/details` (up to ~14 MB,
+best-effort) for the `failed_modules` step deep links; a failed fetch just
+means that field is omitted, never an aborted digest.
 
 ### Mutating tools (require credentials)
 
@@ -302,8 +322,8 @@ authentication is mandatory and deny-by-default. Two tokens define two scopes:
 
 | Token | Scope | Tools |
 | --- | --- | --- |
-| `OPENQA_MCP_HTTP_TOKEN` | write | all 42 read + mutating tools |
-| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 28 read tools only |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 43 read + mutating tools |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 29 read tools only |
 
 Either may be set alone. A read-scope caller sees only the read tools in
 `tools/list` and gets an MCP error — with no openQA request made — if it calls a

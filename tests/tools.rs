@@ -1544,3 +1544,358 @@ async fn list_job_logs_falls_back_to_details_when_ajax_parse_is_empty() {
 
     assert_eq!(text(&result)["source"], "details");
 }
+
+// --- get_job_log_errors ------------------------------------------------
+
+/// The regression test for the whole feature: `serial_terminal.txt`'s
+/// TFAIL must win even though `autoinst-log.txt` also has a "Test died",
+/// and `autoinst-log.txt` must never even be fetched once tier 1 hits.
+#[tokio::test]
+async fn get_job_log_errors_tap_tier_wins_and_names_the_failing_module() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/20/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {
+                "logs": ["autoinst-log.txt", "serial_terminal.txt"],
+                "testresults": [{
+                    "name": "mount08",
+                    "result": "failed",
+                    "details": [{"num": 1, "title": "wait_serial", "result": "fail"}],
+                }],
+            }
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/20/file/serial_terminal.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("before\nmount08.c:42: TFAIL: bad\nafter\n"),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/20/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("# Test died: oops\n"))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 20}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "tap");
+    assert_eq!(value["source"], "serial_terminal.txt");
+    let hits = value["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["text"].as_str().unwrap().contains("TFAIL"))
+    );
+    assert_eq!(value["failed_modules"][0]["module"], "mount08");
+    assert_eq!(
+        value["failed_modules"][0]["steps"][0]["url"],
+        format!("{}/tests/20#step/mount08/1", mock.uri())
+    );
+
+    let requests = mock.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.url.path() != "/tests/20/file/autoinst-log.txt"),
+        "a tap-tier hit must never fetch autoinst-log.txt: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_falls_back_to_test_died_without_a_serial_log() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/21/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/21/file/autoinst-log.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                "before\n# Test died: 'zypper -n ref' failed with code 4\nafter\n",
+            ),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 21}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "test_died");
+    assert_eq!(value["source"], "autoinst-log.txt");
+    let hits = value["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["text"].as_str().unwrap().contains("Test died"))
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_falls_back_to_generic_noise_markers() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/22/details"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/22/file/autoinst-log.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("before\nconnection timed out\nafter\n"),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 22}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "generic");
+    assert!(value.get("failed_modules").is_none());
+}
+
+#[tokio::test]
+async fn get_job_log_errors_no_marker_tier_matches_falls_back_to_tail() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/23/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/23/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(numbered_lines(50)))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 23}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "tail");
+    let hits = value["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 30); // DIGEST_TAIL_LINES
+    assert_eq!(hits[0]["line"], 21);
+    assert_eq!(hits[0]["text"], "line0020");
+    assert_eq!(hits[29]["line"], 50);
+}
+
+#[tokio::test]
+async fn get_job_log_errors_markers_replace_the_tier_chain() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/24/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt", "serial_terminal.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/24/file/autoinst-log.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("before\nBOOM marker here\nafter\n"),
+        )
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log_errors",
+        json!({"job_id": 24, "markers": ["BOOM"]}),
+    )
+    .await
+    .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "custom");
+    assert_eq!(value["source"], "autoinst-log.txt");
+    let hits = value["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["text"].as_str().unwrap().contains("BOOM"))
+    );
+
+    let requests = mock.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.url.path() != "/tests/24/file/serial_terminal.txt"),
+        "`markers` must skip the serial_terminal.txt probe entirely: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_filename_skips_the_serial_terminal_tier() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/25/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["worker-log.txt", "serial_terminal.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/25/file/worker-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("# Test died: custom file\n"))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_job_log_errors",
+        json!({"job_id": 25, "filename": "worker-log.txt"}),
+    )
+    .await
+    .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "test_died");
+    assert_eq!(value["source"], "worker-log.txt");
+
+    let requests = mock.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.url.path() != "/tests/25/file/serial_terminal.txt"),
+        "an explicit `filename` must skip the serial_terminal.txt tier: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_details_failure_still_returns_a_digest() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/26/details"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/26/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(numbered_lines(5)))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 26}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "tail");
+    assert!(value.get("failed_modules").is_none());
+
+    let requests = mock.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.url.path() != "/tests/26/file/serial_terminal.txt"),
+        "a failed /details fetch must skip the serial_terminal.txt probe: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_lossily_decodes_invalid_utf8() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/27/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["serial_terminal.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    let mut body = vec![0xFF, 0xFE];
+    body.extend_from_slice(b"nice05.c:1: TFAIL: bad\n");
+    Mock::given(method("GET"))
+        .and(path("/tests/27/file/serial_terminal.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 27}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "tap");
+    let hits = value["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["text"].as_str().unwrap().contains("TFAIL"))
+    );
+}
+
+#[tokio::test]
+async fn get_job_log_errors_reports_more_hits_past_the_cap() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/28/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    let body = "Failed to connect\n".repeat(20);
+    Mock::given(method("GET"))
+        .and(path("/tests/28/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 28}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "generic");
+    assert_eq!(value["hit_count"], 20);
+    assert_eq!(value["more_hits"], true);
+    // Adjacent matching lines dedup their overlapping context, so the exact
+    // count depends on `DIGEST_CONTEXT_LINES`; only the cap matters here.
+    assert!(value["hits"].as_array().unwrap().len() < 20);
+}
+
+#[tokio::test]
+async fn get_job_log_errors_bad_marker_regex_is_invalid_params() {
+    let mock = MockServer::start().await;
+    let client = server_with_mock(&mock, true).await;
+
+    let err = call(
+        &client,
+        "get_job_log_errors",
+        json!({"job_id": 29, "markers": ["("]}),
+    )
+    .await
+    .expect_err("bad regex must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mock.received_requests().await.expect("requests").is_empty(),
+        "a bad marker pattern must send no HTTP request"
+    );
+}

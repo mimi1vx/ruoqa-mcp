@@ -24,6 +24,24 @@ pub(crate) const MAX_ARCHIVE_MEMBERS: usize = 5000;
 /// gzip/xz/tar magic bytes and, on a 206, learn the artifact's total size.
 pub(crate) const PROBE_BYTES: u64 = 512;
 
+/// `get_job_log_errors`: matching lines kept per tier before the rest only
+/// bump `more_hits` — worst case (3 lines/hit at `DIGEST_CONTEXT_LINES=1`)
+/// keeps one reply under ~45 lines of `hits`.
+pub(crate) const DIGEST_MAX_HITS: usize = 15;
+/// `get_job_log_errors`: context lines kept on each side of a marker hit.
+pub(crate) const DIGEST_CONTEXT_LINES: usize = 1;
+/// `get_job_log_errors`: lines returned by the `tail` tier when no marker
+/// tier matched.
+pub(crate) const DIGEST_TAIL_LINES: usize = 30;
+/// `get_job_log_errors`: a hit's displayed line is truncated here (matching
+/// still runs on the full line, so a marker past this column is never
+/// missed).
+pub(crate) const DIGEST_MAX_LINE_CHARS: usize = 300;
+/// `get_job_log_errors`: cap on how many failed test modules `failed_modules`
+/// reports, so a job with a huge number of failures can't produce an
+/// unbounded reply.
+pub(crate) const DIGEST_MAX_MODULES: usize = 10;
+
 /// Reject `len` outside `[min, max]` with a message naming `field`, the
 /// observed count, and the limit that was crossed.
 pub(crate) fn bounded(field: &str, len: usize, min: usize, max: usize) -> Result<(), ErrorData> {

@@ -16,7 +16,7 @@
 use std::sync::LazyLock;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use reqwest::header::{CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED, RANGE};
 use reqwest::{Method, StatusCode};
 use rmcp::model::CallToolResult;
@@ -24,9 +24,11 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
 use ruoqa::PreparedRequest;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::{classify, status_kind, tool_error};
 use crate::heartbeat::with_heartbeat;
+use crate::tools::{DIGEST_MAX_LINE_CHARS, DIGEST_MAX_MODULES, PROBE_BYTES};
 
 /// Bytes assumed per log line when sizing a tail read. Generous relative to
 /// a typical openQA log line, so a `tail_lines` request rarely needs the
@@ -693,6 +695,248 @@ fn grep_lines(text: &str, re: &Regex, context_lines: usize, max_matches: usize) 
     }
 }
 
+// --- `get_job_log_errors` digest -------------------------------------------
+//
+// Three tiers, checked in priority order by the caller (tools/read.rs): a
+// real openQA log is full of incidental "error"/"timeout" strings from
+// subprocess output (grub, curl, ssh) that have nothing to do with the test
+// verdict.
+//   1. TAP_MARKERS in serial_terminal.txt — frameworks driven over the
+//      serial console (LTP and similar) report their actual assertion
+//      result only here (TINFO/TFAIL/TBROK, LTP's own TAP-like convention),
+//      never in autoinst-log.txt.
+//   2. FATAL_MARKERS in autoinst-log.txt — the literal "# Test died:"
+//      os-autoinst itself writes when a module dies.
+//   3. NOISE_MARKERS in autoinst-log.txt — fallback only.
+// Ported from reviewpc's `lib/oqa-fetch.mjs` (TAP_MARKERS/FATAL_MARKERS/
+// NOISE_MARKERS), with each pattern's `/i` flag inlined as `(?i)` for
+// `RegexSet`, which compiles every member pattern independently.
+pub(crate) static TAP_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([r"\bTFAIL\b", r"\bTBROK\b", r"^not ok"]).expect("static regex set")
+});
+pub(crate) static FATAL_MARKERS: LazyLock<RegexSet> =
+    LazyLock::new(|| RegexSet::new(["Test died", r"(?i)\bdied\b"]).expect("static regex set"));
+pub(crate) static NOISE_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)timed? ?out",
+        "Failed to ",
+        r"(?i)\berror:",
+        r"\bERROR\b",
+        r"(?i)command .* failed",
+    ])
+    .expect("static regex set")
+});
+
+/// When true, every tier's reply also carries the tail (the reference
+/// implementation's behaviour); when false (the default — a tier match
+/// means the tail's file may never even have been fetched, see the plan's
+/// deviation note), the `tail` tier only fires on its own, once nothing
+/// else matched.
+pub(crate) const TAIL_ALWAYS: bool = false;
+
+/// Compiles each `markers` pattern individually first (so a bad one is
+/// named in the error, mirroring `slice`'s grep-pattern message), then as
+/// one combined [`RegexSet`].
+pub(crate) fn compile_markers(patterns: &[String]) -> Result<RegexSet, ErrorData> {
+    for pattern in patterns {
+        Regex::new(pattern).map_err(|e| {
+            ErrorData::invalid_params(format!("invalid marker pattern {pattern:?}: {e}"), None)
+        })?;
+    }
+    RegexSet::new(patterns)
+        .map_err(|e| ErrorData::invalid_params(format!("invalid markers: {e}"), None))
+}
+
+/// Truncates `line` to `max_chars` **characters** (not bytes) with a
+/// trailing `…`; matching against `set` always runs on the untruncated line
+/// first, so a marker past this column is never missed, only unshown.
+fn truncate_line(line: &str, max_chars: usize) -> String {
+    if line.chars().count() <= max_chars {
+        return line.to_string();
+    }
+    let mut truncated: String = line.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
+pub(crate) struct ScanResult {
+    pub(crate) hits: Vec<MatchHit>,
+    /// True count of matching lines, uncapped (unlike `hits`, which stops
+    /// growing past `max_hits`).
+    pub(crate) hit_count: usize,
+    pub(crate) more_hits: bool,
+    pub(crate) total_lines: usize,
+}
+
+/// One pass over `text`, emitting every line matching `set` plus `context`
+/// lines either side, capped at `max_hits` *matching* lines (context lines
+/// don't count against it). Never emits the same line twice: a match whose
+/// context range overlaps the previous one only contributes its new tail
+/// (ports `oqa-fetch.mjs`'s `collectContextHits` `lastPrinted` guard).
+pub(crate) fn scan_markers(
+    text: &str,
+    set: &RegexSet,
+    context: usize,
+    max_hits: usize,
+) -> ScanResult {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hits = Vec::new();
+    let mut hit_count = 0usize;
+    let mut last_emitted: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if !set.is_match(line) {
+            continue;
+        }
+        hit_count += 1;
+        if hit_count > max_hits {
+            continue;
+        }
+        let from = idx.saturating_sub(context);
+        let to = (idx + context).min(lines.len().saturating_sub(1));
+        let start = last_emitted.map_or(from, |last| from.max(last + 1));
+        if start <= to {
+            for (i, &l) in lines.iter().enumerate().take(to + 1).skip(start) {
+                hits.push(MatchHit {
+                    line: i + 1,
+                    text: truncate_line(l, DIGEST_MAX_LINE_CHARS),
+                });
+            }
+            last_emitted = Some(to);
+        }
+    }
+    ScanResult {
+        hits,
+        hit_count,
+        more_hits: hit_count > max_hits,
+        total_lines: lines.len(),
+    }
+}
+
+/// The last `n` lines of `text`, correctly numbered from the start of the
+/// file (not from 1).
+pub(crate) fn tail_hits(text: &str, n: usize) -> Vec<MatchHit> {
+    let lines: Vec<&str> = text.lines().collect();
+    if n == 0 {
+        return Vec::new();
+    }
+    let start = lines.len().saturating_sub(n);
+    lines[start..]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| MatchHit {
+            line: start + i + 1,
+            text: truncate_line(line, DIGEST_MAX_LINE_CHARS),
+        })
+        .collect()
+}
+
+/// GET, decode (gzip/xz transparently; a tar is refused, same message
+/// `get_job_log` gives), and lossily decode as UTF-8 — `serial_terminal.txt`
+/// is raw console output that routinely carries stray non-UTF-8 bytes,
+/// unlike `get_job_log`'s strict `unsupported_media` refusal.
+pub(crate) async fn fetch_text_lossy(
+    client: &ruoqa::Client,
+    ctx: &RequestContext<RoleServer>,
+    job_id: i64,
+    filename: &str,
+    ceiling: usize,
+) -> Result<String, Bail> {
+    let probed = probe(client, ctx, job_id, filename, PROBE_BYTES, ceiling).await?;
+    let content = fetch_decoded(client, ctx, job_id, filename, &probed, ceiling).await?;
+    if sniff(&content) == Sniff::Tar {
+        return Err(params_bail(format!(
+            "{filename:?} is an archive; pass `member` (see list_job_log_members) to read one entry"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&content).into_owned())
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FailedStep {
+    pub(crate) num: u64,
+    pub(crate) title: String,
+    pub(crate) result: String,
+    pub(crate) url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FailedModule {
+    pub(crate) module: String,
+    pub(crate) result: String,
+    pub(crate) steps: Vec<FailedStep>,
+}
+
+/// `GET /api/v1/jobs/<id>/details` renders `{"job": {..., "testresults": \
+/// [...]}}` (`OpenQA::WebAPI::Controller::API::V1::Job::show`, `render(json \
+/// => {job => $job})`). Keeps failed/softfailed modules (capped at
+/// `DIGEST_MAX_MODULES`) and, per module, the step results that are
+/// themselves `fail`/`softfail` — never `text_data`, which is
+/// `get_job_details`'s job. Deliberately **not** every non-`"ok"` step:
+/// live-tested against job 23779447's `patch_and_reboot` (274 steps, only
+/// one `fail` and five `softfail`), 139 of its steps are `unk` — a
+/// needle-less screenshot os-autoinst never scored, not a failure signal —
+/// and including them would have swamped the digest with noise.
+pub(crate) fn failed_modules(
+    details: &Value,
+    job_id: i64,
+    base_url: &reqwest::Url,
+) -> Vec<FailedModule> {
+    let job = details.get("job").unwrap_or(details);
+    let Some(results) = job.get("testresults").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut modules = Vec::new();
+    for module in results {
+        let result = module.get("result").and_then(Value::as_str).unwrap_or("");
+        if result != "failed" && result != "softfailed" {
+            continue;
+        }
+        if modules.len() >= DIGEST_MAX_MODULES {
+            break;
+        }
+        let name = module.get("name").and_then(Value::as_str).unwrap_or("");
+        let steps = module
+            .get("details")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|d| {
+                let step_result = d.get("result").and_then(Value::as_str)?;
+                if step_result != "fail" && step_result != "softfail" {
+                    return None;
+                }
+                let num = d.get("num").and_then(Value::as_u64).unwrap_or(0);
+                let title = d.get("title").and_then(Value::as_str).unwrap_or("");
+                Some(FailedStep {
+                    num,
+                    title: title.to_string(),
+                    result: step_result.to_string(),
+                    url: format!("{base_url}tests/{job_id}#step/{name}/{num}"),
+                })
+            })
+            .collect();
+        modules.push(FailedModule {
+            module: name.to_string(),
+            result: result.to_string(),
+            steps,
+        });
+    }
+    modules
+}
+
+/// Whether `name` is listed in `/details`'s `logs`/`ulogs` arrays — used to
+/// skip probing `serial_terminal.txt` on jobs that never wrote one, instead
+/// of costing a 404.
+pub(crate) fn has_log(details: &Value, name: &str) -> bool {
+    let job = details.get("job").unwrap_or(details);
+    ["logs", "ulogs"].iter().any(|key| {
+        job.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(name)))
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct LogFile {
     pub(crate) name: String,
@@ -754,6 +998,7 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+    use crate::tools::DIGEST_MAX_HITS;
 
     #[test]
     fn validate_filename_rejects_traversal_and_separators() {
@@ -970,5 +1215,176 @@ mod tests {
             builder.append_data(&mut header, name, *data).unwrap();
         }
         builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn tap_markers_match_only_their_own_lines() {
+        assert!(TAP_MARKERS.is_match("nice05.c:138: TFAIL: executes less cycles"));
+        assert!(TAP_MARKERS.is_match("mount08.c:99: TBROK: mount failed"));
+        assert!(TAP_MARKERS.is_match("not ok 3 - some assertion"));
+        // `^not ok` must anchor at line start, not match a commented-out TAP line.
+        assert!(!TAP_MARKERS.is_match("# not ok, this is just a comment"));
+        assert!(!TAP_MARKERS.is_match("everything is fine"));
+    }
+
+    #[test]
+    fn fatal_markers_match_test_died_and_died() {
+        assert!(FATAL_MARKERS.is_match("# Test died: 'zypper -n ref' failed with code 4"));
+        assert!(FATAL_MARKERS.is_match("the process died unexpectedly"));
+        assert!(FATAL_MARKERS.is_match("the process DIED unexpectedly")); // case-insensitive
+        assert!(!FATAL_MARKERS.is_match("everything is fine"));
+    }
+
+    #[test]
+    fn noise_markers_error_colon_is_case_insensitive_but_bare_error_is_not() {
+        // `error:` alone only matches the case-insensitive `(?i)\berror:` member.
+        assert!(NOISE_MARKERS.is_match("connection error: refused"));
+        assert!(NOISE_MARKERS.is_match("connection ERROR: refused"));
+        // Bare `error` (no colon) must not match: `\bERROR\b` is case-sensitive
+        // and `(?i)\berror:` requires the colon.
+        assert!(!NOISE_MARKERS.is_match("a harmless error occurred, retrying"));
+        assert!(NOISE_MARKERS.is_match("ERROR"));
+        assert!(NOISE_MARKERS.is_match("timeout waiting for serial"));
+        assert!(NOISE_MARKERS.is_match("Failed to connect"));
+        assert!(NOISE_MARKERS.is_match("command ssh failed"));
+    }
+
+    #[test]
+    fn truncate_line_keeps_short_lines_untouched() {
+        assert_eq!(truncate_line("short line", 300), "short line");
+    }
+
+    #[test]
+    fn truncate_line_truncates_on_a_char_boundary() {
+        // Multi-byte chars throughout; truncation must count chars, not
+        // bytes, and never panic by slicing mid-character.
+        let line: String = "é".repeat(310);
+        let truncated = truncate_line(&line, 300);
+        assert_eq!(truncated.chars().count(), 301); // 300 chars + the trailing …
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn scan_markers_merges_overlapping_context_without_duplicate_lines() {
+        // Matches on adjacent lines 2 and 3 (1-based) with context=1 would
+        // naively both claim line 3; each line must appear exactly once.
+        let text = "one\nTFAIL here\nTFAIL again\nfour\nfive";
+        let result = scan_markers(text, &TAP_MARKERS, 1, DIGEST_MAX_HITS);
+        assert_eq!(result.hit_count, 2);
+        assert!(!result.more_hits);
+        let lines: Vec<usize> = result.hits.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![1, 2, 3, 4]);
+        let unique: std::collections::BTreeSet<_> = lines.iter().collect();
+        assert_eq!(unique.len(), lines.len(), "no line emitted twice");
+    }
+
+    #[test]
+    fn scan_markers_reports_more_hits_past_the_cap() {
+        let text = "TFAIL\nTFAIL\nTFAIL\nTFAIL";
+        let result = scan_markers(text, &TAP_MARKERS, 0, 2);
+        assert_eq!(result.hit_count, 4);
+        assert!(result.more_hits);
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.total_lines, 4);
+    }
+
+    #[test]
+    fn scan_markers_truncates_hit_text_on_a_char_boundary() {
+        let long_line = "é".repeat(310);
+        let text = format!("before\n{long_line} TFAIL\nafter");
+        let result = scan_markers(&text, &TAP_MARKERS, 0, DIGEST_MAX_HITS);
+        assert_eq!(result.hit_count, 1);
+        assert!(result.hits[0].text.ends_with('…'));
+        assert!(result.hits[0].text.chars().count() <= DIGEST_MAX_LINE_CHARS + 1);
+    }
+
+    #[test]
+    fn tail_hits_numbers_from_the_start_of_the_file() {
+        let text = numbered_text(10);
+        let hits = tail_hits(&text, 3);
+        let lines: Vec<usize> = hits.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![8, 9, 10]);
+        assert_eq!(hits[0].text, "line08");
+    }
+
+    #[test]
+    fn tail_hits_shorter_than_n_returns_the_whole_text() {
+        let text = numbered_text(2);
+        let hits = tail_hits(&text, 30);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, 1);
+    }
+
+    fn numbered_text(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("line{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compile_markers_names_the_bad_pattern() {
+        let err = compile_markers(&["good".to_string(), "(bad".to_string()]).unwrap_err();
+        assert!(err.message.contains("(bad"));
+    }
+
+    #[test]
+    fn compile_markers_builds_a_working_set() {
+        let set = compile_markers(&["foo".to_string(), "bar".to_string()]).unwrap();
+        assert!(set.is_match("a foo line"));
+        assert!(!set.is_match("neither"));
+    }
+
+    #[test]
+    fn failed_modules_builds_the_exact_step_deep_link() {
+        let details = serde_json::json!({
+            "job": {
+                "testresults": [
+                    {
+                        "name": "mount08",
+                        "result": "softfailed",
+                        "details": [
+                            {"num": 1, "title": "wait_serial", "result": "ok"},
+                            {"num": 2, "title": "wait_serial", "result": "fail"},
+                            // `unk` is a needle-less screenshot os-autoinst
+                            // never scored, not a failure — must be dropped.
+                            {"num": 3, "title": "", "result": "unk"},
+                        ]
+                    },
+                    {"name": "boot", "result": "passed", "details": []}
+                ]
+            }
+        });
+        let base = reqwest::Url::parse("https://openqa.suse.de/").unwrap();
+        let modules = failed_modules(&details, 23_222_647, &base);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].module, "mount08");
+        assert_eq!(modules[0].steps.len(), 1);
+        assert_eq!(
+            modules[0].steps[0].url,
+            "https://openqa.suse.de/tests/23222647#step/mount08/2"
+        );
+    }
+
+    #[test]
+    fn failed_modules_caps_at_digest_max_modules() {
+        let testresults: Vec<_> = (0..DIGEST_MAX_MODULES + 5)
+            .map(
+                |i| serde_json::json!({"name": format!("m{i}"), "result": "failed", "details": []}),
+            )
+            .collect();
+        let details = serde_json::json!({"job": {"testresults": testresults}});
+        let base = reqwest::Url::parse("https://openqa.suse.de/").unwrap();
+        let modules = failed_modules(&details, 1, &base);
+        assert_eq!(modules.len(), DIGEST_MAX_MODULES);
+    }
+
+    #[test]
+    fn has_log_checks_logs_and_ulogs_under_the_job_wrapper() {
+        let details = serde_json::json!({
+            "job": {"logs": ["autoinst-log.txt", "serial_terminal.txt"], "ulogs": []}
+        });
+        assert!(has_log(&details, "serial_terminal.txt"));
+        assert!(!has_log(&details, "video.webm"));
     }
 }
