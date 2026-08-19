@@ -207,9 +207,13 @@ exhaustive artifact inventory; note that `video.webm` classes as
 checking, in priority order, `serial_terminal.txt` for LTP/TAP-style
 `TFAIL`/`TBROK` (the actual verdict for serial-console-driven frameworks,
 never duplicated into `autoinst-log.txt`), then `autoinst-log.txt` for
-"Test died", then a generic error/timeout fallback, then just the last 30
-lines — the first tier that matches wins, and each reply is bounded to a
-fixed line budget regardless of the log's size. `serial_terminal.txt` is
+"Test died" or the worker's own terminal verdict (`Result: setup
+failure`/`api-failure`/`worker broken`/`timeout`/`died`, for an abnormal
+termination that never goes through a module death, e.g. an asset failing
+to download before any test module runs), then a generic error/timeout
+fallback, then just the last 30 lines — the first tier that matches wins,
+and each reply is bounded to a fixed line budget regardless of the log's
+size. `serial_terminal.txt` is
 probed first (and only) because it is where a real product-assertion
 failure shows up for those frameworks; a job that never wrote one (checked
 via `/details`) skips the probe entirely rather than costing a 404. Unlike
