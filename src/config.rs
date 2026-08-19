@@ -151,6 +151,15 @@ pub struct EnvConfig {
     /// default) leaves ruoqa's `client.conf` discovery untouched; tests pass
     /// `Some(vec![])` so they never read the developer's real config file.
     pub config_paths: Option<Vec<PathBuf>>,
+    /// Whether `$OPENQA_API_KEY` is set to a non-empty value. Read here
+    /// (rather than inside `servers::build_registry`) so every env-derived
+    /// input stays collected in one place. Must stay in sync with
+    /// `ruoqa::config::API_KEY_ENV`, which is `pub(crate)` there and not
+    /// importable (`ruoqa-0.2.0/src/config.rs`).
+    pub api_key_set: bool,
+    /// Same as `api_key_set`, for `$OPENQA_API_SECRET` /
+    /// `ruoqa::config::API_SECRET_ENV`.
+    pub api_secret_set: bool,
 }
 
 impl EnvConfig {
@@ -161,6 +170,8 @@ impl EnvConfig {
             verify: std::env::var("OPENQA_VERIFY").ok(),
             timeout: std::env::var("OPENQA_MCP_TIMEOUT").ok(),
             config_paths: None,
+            api_key_set: std::env::var("OPENQA_API_KEY").is_ok_and(|v| !v.is_empty()),
+            api_secret_set: std::env::var("OPENQA_API_SECRET").is_ok_and(|v| !v.is_empty()),
         }
     }
 }
@@ -180,10 +191,21 @@ impl EnvConfig {
     reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
 )]
 pub fn build_client(env: &EnvConfig) -> Result<Client> {
+    build_one(env, env.server.as_deref().unwrap_or_default())
+}
+
+/// Build a single `Client` for `server`, sharing `env`'s tls/timeout/
+/// config-path settings. Used by [`build_client`] for the single-server case
+/// and by [`crate::servers::build_registry`] once per `OPENQA_SERVER` entry.
+#[allow(
+    clippy::result_large_err,
+    reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
+)]
+pub(crate) fn build_one(env: &EnvConfig, server: &str) -> Result<Client> {
     let tls = parse_verify(env.verify.as_deref())?;
     let timeouts = parse_timeout(env.timeout.as_deref()).map_err(|e| Error::Config(Box::new(e)))?;
     let mut builder = ClientBuilder::new()
-        .server(env.server.clone().unwrap_or_default())
+        .server(server)
         .tls(tls)
         .timeouts(timeouts);
     if let Some(paths) = env.config_paths.clone() {
@@ -193,6 +215,7 @@ pub fn build_client(env: &EnvConfig) -> Result<Client> {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // edition 2024 requires unsafe for std::env::set_var
 mod tests {
     use super::*;
 
@@ -300,8 +323,36 @@ mod tests {
             verify: None,
             timeout: None,
             config_paths: Some(vec![]), // never touch the developer's real client.conf
+            api_key_set: false,
+            api_secret_set: false,
         };
         let client = build_client(&env).unwrap();
         assert_eq!(client.base_url().host_str(), Some("openqa.example.com"));
+    }
+
+    #[test]
+    fn env_config_reads_credential_presence() {
+        // SAFETY: no other test in this binary mutates these variables.
+        unsafe {
+            std::env::remove_var("OPENQA_API_KEY");
+            std::env::remove_var("OPENQA_API_SECRET");
+        }
+        assert!(!EnvConfig::from_env().api_key_set);
+        assert!(!EnvConfig::from_env().api_secret_set);
+
+        unsafe { std::env::set_var("OPENQA_API_KEY", "") };
+        assert!(!EnvConfig::from_env().api_key_set, "empty is not set");
+
+        unsafe {
+            std::env::set_var("OPENQA_API_KEY", "k");
+            std::env::set_var("OPENQA_API_SECRET", "s");
+        }
+        assert!(EnvConfig::from_env().api_key_set);
+        assert!(EnvConfig::from_env().api_secret_set);
+
+        unsafe {
+            std::env::remove_var("OPENQA_API_KEY");
+            std::env::remove_var("OPENQA_API_SECRET");
+        }
     }
 }
