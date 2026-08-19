@@ -1,4 +1,4 @@
-//! Table-driven request-shape check for all 43 registered tools: method,
+//! Table-driven request-shape check for all 44 registered tools: method,
 //! path, query string, and body/form-encoding. `tests/tools.rs` asserts
 //! response handling and edge cases; this file asserts only where and how
 //! each tool's request goes out, so a typo'd `format!` path or a `GET` where
@@ -9,10 +9,15 @@ use std::collections::BTreeSet;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
-use ruoqa_mcp::OpenQaServer;
+use ruoqa_mcp::{OpenQaServer, ServerRegistry};
 use serde_json::{Value, json};
 use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// The fixed `server` id every case's mock-backed client is registered
+/// under; `call()` injects it into any argument object that doesn't already
+/// name one.
+const TEST_SERVER: &str = "test";
 
 async fn run_server(mock: &MockServer) -> RunningService<RoleClient, ()> {
     let client = ruoqa::ClientBuilder::new()
@@ -20,7 +25,9 @@ async fn run_server(mock: &MockServer) -> RunningService<RoleClient, ()> {
         .config_paths(vec![])
         .build()
         .expect("build client");
-    let server = OpenQaServer::new(client, false);
+    let mut clients = std::collections::HashMap::new();
+    clients.insert(TEST_SERVER.to_string(), client);
+    let server = OpenQaServer::new(ServerRegistry::from_map(clients), false);
 
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -33,10 +40,10 @@ async fn run_server(mock: &MockServer) -> RunningService<RoleClient, ()> {
 }
 
 async fn call(client: &RunningService<RoleClient, ()>, name: &str, args: &Value) {
-    let mut params = CallToolRequestParams::new(name.to_string());
-    if let Some(obj) = args.as_object() {
-        params = params.with_arguments(obj.clone());
-    }
+    let mut obj = args.as_object().cloned().unwrap_or_default();
+    obj.entry("server".to_string())
+        .or_insert_with(|| json!(TEST_SERVER));
+    let params = CallToolRequestParams::new(name.to_string()).with_arguments(obj);
     // A mock backend answers every route with `200 {}`, so a call error here
     // means the client-side plumbing broke, not the routing under test.
     client
@@ -417,7 +424,11 @@ fn cases() -> Vec<Case> {
 /// can't satisfy this file's exactly-one-request-per-case assumption.
 /// `get_job_log_errors` issues a `/details` fetch plus a conditional number
 /// of tier fetches, same problem.
-const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs", "get_job_log_errors"];
+/// `list_servers` sends no request at all (it just echoes the configured
+/// registry), so it has no place in a matrix whose whole purpose is request
+/// shape; excluded here rather than forcing `Case` to represent a no-request
+/// tool.
+const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs", "get_job_log_errors", "list_servers"];
 
 /// Names covered by [`cases`] plus [`COVERED_OUTSIDE_MATRIX`], for the
 /// coverage-ratchet guard test below.

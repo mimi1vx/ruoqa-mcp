@@ -15,7 +15,8 @@ use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
 use ruoqa_mcp::http::{AuthConfigError, HttpAuth, HttpEnv, allowed_hosts, router};
-use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer, build_client};
+use ruoqa_mcp::servers::build_registry;
+use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer};
 
 fn main() -> anyhow::Result<()> {
     // Before the runtime, and therefore before any other thread exists.
@@ -95,11 +96,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .then(|| HttpAuth::resolve(&http_env, cli.insecure_no_auth))
         .transpose()?;
 
-    let client = build_client(&EnvConfig::from_env()).context("failed to build openQA client")?;
+    let servers =
+        build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;
     ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
     let call_timeout =
         ruoqa_mcp::config::call_timeout().context("invalid OPENQA_MCP_CALL_TIMEOUT")?;
-    let server = OpenQaServer::new(client, readonly).with_call_timeout(call_timeout);
+    let server = OpenQaServer::new(servers, readonly).with_call_timeout(call_timeout);
     match auth {
         Some(auth) => run_http(server, auth, &cli).await,
         None => run_stdio(server).await,

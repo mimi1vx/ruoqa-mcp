@@ -17,6 +17,7 @@ use crate::error::{classify, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
+use crate::servers::ServerRegistry;
 
 const INSTRUCTIONS: &str = "Query and control an openQA instance. Read tools inspect jobs, \
 machines, test suites, and products; mutating tools restart/cancel/delete jobs, comment, and \
@@ -32,7 +33,7 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Clone)]
 pub struct OpenQaServer {
-    pub(crate) client: ruoqa::Client,
+    pub(crate) servers: ServerRegistry,
     tool_router: ToolRouter<Self>,
     /// Whether each request must carry a [`Scope`]. Off for stdio, where the
     /// process credential is the only principal there is.
@@ -47,14 +48,14 @@ impl OpenQaServer {
     /// keeps `--readonly` a compile-time-guaranteed subset rather than a
     /// hand-maintained list of mutating tool names to disable at runtime.
     #[must_use]
-    pub fn new(client: ruoqa::Client, readonly: bool) -> Self {
+    pub fn new(servers: ServerRegistry, readonly: bool) -> Self {
         let tool_router = if readonly {
             Self::read_tool_router()
         } else {
             Self::read_tool_router() + Self::write_tool_router()
         };
         Self {
-            client,
+            servers,
             tool_router,
             enforce_scopes: false,
             call_timeout: Some(DEFAULT_CALL_TIMEOUT),
@@ -76,6 +77,22 @@ impl OpenQaServer {
         self
     }
 
+    /// Resolve a tool call's `server` argument, or an `invalid_params` error
+    /// naming the configured set. The only place an unrecognized `server`
+    /// value is rejected: a lookup into an operator-configured allow-list,
+    /// never a fetch to an arbitrary host.
+    pub(crate) fn resolve_server(&self, selector: &str) -> Result<&ruoqa::Client, ErrorData> {
+        self.servers.resolve(selector).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "unknown server {selector:?}; configured servers: {}",
+                    self.servers.identifiers().join(", ")
+                ),
+                None,
+            )
+        })
+    }
+
     /// Fail-closed authorization for one tool call.
     fn authorize(&self, name: &str, context: &RequestContext<RoleServer>) -> Result<(), ErrorData> {
         if !self.enforce_scopes {
@@ -94,29 +111,26 @@ impl OpenQaServer {
     pub(crate) async fn request_json(
         &self,
         ctx: &RequestContext<RoleServer>,
+        client: &ruoqa::Client,
         method: Method,
         path: &str,
     ) -> ruoqa::Result<Value> {
         let token = ctx.meta.get_progress_token();
-        with_heartbeat(&ctx.peer, token, self.client.request(method, path, None)).await
+        with_heartbeat(&ctx.peer, token, client.request(method, path, None)).await
     }
 
     /// Form-encoded write under a heartbeat.
     pub(crate) async fn request_form(
         &self,
         ctx: &RequestContext<RoleServer>,
+        client: &ruoqa::Client,
         method: Method,
         path: &str,
         form: &Form,
     ) -> ruoqa::Result<Value> {
         let token = ctx.meta.get_progress_token();
         let pairs = form.pairs();
-        with_heartbeat(
-            &ctx.peer,
-            token,
-            self.client.request_form(method, path, &pairs),
-        )
-        .await
+        with_heartbeat(&ctx.peer, token, client.request_form(method, path, &pairs)).await
     }
 }
 
@@ -221,6 +235,36 @@ mod tests {
         };
         assert_eq!(text.text, "{}");
     }
+
+    fn fixture_registry() -> ServerRegistry {
+        let mut clients = std::collections::HashMap::new();
+        for id in ["one", "two"] {
+            let client = ruoqa::ClientBuilder::new()
+                .server(format!("https://{id}.example.com"))
+                .config_paths(vec![])
+                .build()
+                .expect("build client");
+            clients.insert(id.to_string(), client);
+        }
+        ServerRegistry::from_map(clients)
+    }
+
+    #[test]
+    fn resolve_server_finds_a_known_id() {
+        let server = OpenQaServer::new(fixture_registry(), false);
+        assert!(server.resolve_server("one").is_ok());
+        assert!(server.resolve_server("two").is_ok());
+    }
+
+    #[test]
+    fn resolve_server_names_the_configured_set_for_an_unknown_id() {
+        let server = OpenQaServer::new(fixture_registry(), false);
+        let err = server.resolve_server("nope").unwrap_err();
+        let message = err.message.to_string();
+        assert!(message.contains("nope"), "{message}");
+        assert!(message.contains("one"), "{message}");
+        assert!(message.contains("two"), "{message}");
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +304,7 @@ mod router_tests {
         "list_job_log_members",
         "get_job_log",
         "get_job_log_errors",
+        "list_servers",
     ];
 
     // Matches the README's "Mutating tools" table exactly.
@@ -290,7 +335,7 @@ mod router_tests {
 
     #[test]
     fn read_router_matches_readme_table() {
-        assert_eq!(READ_TOOL_NAMES.len(), 29);
+        assert_eq!(READ_TOOL_NAMES.len(), 30);
         let expected: BTreeSet<String> = READ_TOOL_NAMES
             .iter()
             .map(std::string::ToString::to_string)
@@ -311,7 +356,7 @@ mod router_tests {
     #[test]
     fn readonly_excludes_write_tools() {
         let full = OpenQaServer::read_tool_router() + OpenQaServer::write_tool_router();
-        assert_eq!(full.list_all().len(), 43);
+        assert_eq!(full.list_all().len(), 44);
     }
 
     // The scope gate reads `read_only_hint`, so an unannotated (or inverted)

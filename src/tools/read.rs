@@ -22,6 +22,9 @@ use crate::tools::{
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListJobsArgs {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     #[serde(default)]
     pub state: Option<String>,
     #[serde(default)]
@@ -57,6 +60,9 @@ pub struct ListJobsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListJobsOverviewArgs {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     #[serde(default)]
     pub state: Option<String>,
     #[serde(default)]
@@ -90,17 +96,26 @@ pub struct ListJobsOverviewArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindJobsBySetting {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub key: String,
     pub list_value: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobStatus {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     #[serde(default)]
     pub follow: Option<i64>,
@@ -108,11 +123,17 @@ pub struct JobStatus {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroupId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub group_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BuildResults {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub group_id: i64,
     #[serde(default)]
     pub limit_builds: Option<i64>,
@@ -126,32 +147,50 @@ pub struct BuildResults {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AssetId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub asset_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Search {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub q: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScheduledProductId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub scheduled_product_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ParentGroupId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub parent_group_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobLogFile {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub filename: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetJobLog {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub filename: String,
     /// A path inside a tar/tar.gz/tar.xz archive to extract, from
@@ -183,7 +222,17 @@ pub struct GetJobLog {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ServerOnly {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetJobLogErrors {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     /// Regex patterns that replace the whole tier chain: scans `filename`
     /// (default `autoinst-log.txt`) for any of these instead, still falling
@@ -236,6 +285,7 @@ temporary file and process it with jq, e.g. `jq '.jobs[] | select(.result==\"fai
         Parameters(args): Parameters<ListJobsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&args.server)?;
         bounded("ids", args.ids.as_ref().map_or(0, Vec::len), 0, MAX_IDS)?;
         let path = Query::new()
             .push("state", args.state)
@@ -253,7 +303,7 @@ temporary file and process it with jq, e.g. `jq '.jobs[] | select(.result==\"fai
             .push("offset", args.offset)
             .push_all("ids", args.ids.as_deref())
             .finish(&api("jobs"));
-        let body = self.request_json(&ctx, Method::GET, &path).await;
+        let body = self.request_json(&ctx, client, Method::GET, &path).await;
         match body {
             Ok(value) if args.summary => {
                 let jobs = jobs_array("list_jobs", &value, false)?;
@@ -275,6 +325,7 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
         Parameters(args): Parameters<ListJobsOverviewArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&args.server)?;
         bounded("ids", args.ids.as_ref().map_or(0, Vec::len), 0, MAX_IDS)?;
         let path = Query::new()
             .push("state", args.state)
@@ -291,7 +342,7 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
             .push("limit", args.limit)
             .push_all("ids", args.ids.as_deref())
             .finish(&api("jobs/overview"));
-        let body = self.request_json(&ctx, Method::GET, &path).await;
+        let body = self.request_json(&ctx, client, Method::GET, &path).await;
         match body {
             Ok(value) if args.summary => {
                 let jobs = jobs_array("list_jobs_overview", &value, true)?;
@@ -307,11 +358,12 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}")))
+            self.request_json(&ctx, client, Method::GET, &api(&format!("jobs/{job_id}")))
                 .await,
         )
     }
@@ -322,12 +374,18 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job_comments(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/comments")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("jobs/{job_id}/comments")),
+            )
+            .await,
         )
     }
 
@@ -337,9 +395,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_machines(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        to_result(self.request_json(&ctx, Method::GET, &api("machines")).await)
+        let client = self.resolve_server(&server)?;
+        to_result(
+            self.request_json(&ctx, client, Method::GET, &api("machines"))
+                .await,
+        )
     }
 
     #[tool(
@@ -348,10 +411,12 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_test_suites(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api("test_suites"))
+            self.request_json(&ctx, client, Method::GET, &api("test_suites"))
                 .await,
         )
     }
@@ -362,9 +427,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_products(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        to_result(self.request_json(&ctx, Method::GET, &api("products")).await)
+        let client = self.resolve_server(&server)?;
+        to_result(
+            self.request_json(&ctx, client, Method::GET, &api("products"))
+                .await,
+        )
     }
 
     #[tool(
@@ -373,14 +443,19 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn find_jobs_by_setting(
         &self,
-        Parameters(FindJobsBySetting { key, list_value }): Parameters<FindJobsBySetting>,
+        Parameters(FindJobsBySetting {
+            server,
+            key,
+            list_value,
+        }): Parameters<FindJobsBySetting>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let path = Query::new()
             .push("key", Some(key))
             .push("list_value", Some(list_value))
             .finish(&api("job_settings/jobs"));
-        to_result(self.request_json(&ctx, Method::GET, &path).await)
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(
@@ -389,12 +464,18 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job_details(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/details")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("jobs/{job_id}/details")),
+            )
+            .await,
         )
     }
 
@@ -404,22 +485,29 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job_status(
         &self,
-        Parameters(JobStatus { job_id, follow }): Parameters<JobStatus>,
+        Parameters(JobStatus {
+            server,
+            job_id,
+            follow,
+        }): Parameters<JobStatus>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let path = Query::new()
             .push("follow", follow)
             .finish(&api(&format!("experimental/jobs/{job_id}/status")));
-        to_result(self.request_json(&ctx, Method::GET, &path).await)
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(description = "List job groups.", annotations(read_only_hint = true))]
     async fn list_job_groups(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api("job_groups"))
+            self.request_json(&ctx, client, Method::GET, &api("job_groups"))
                 .await,
         )
     }
@@ -430,12 +518,18 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job_group(
         &self,
-        Parameters(GroupId { group_id }): Parameters<GroupId>,
+        Parameters(GroupId { server, group_id }): Parameters<GroupId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api(&format!("job_groups/{group_id}")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("job_groups/{group_id}")),
+            )
+            .await,
         )
     }
 
@@ -445,12 +539,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_job_group_jobs(
         &self,
-        Parameters(GroupId { group_id }): Parameters<GroupId>,
+        Parameters(GroupId { server, group_id }): Parameters<GroupId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::GET,
                 &api(&format!("job_groups/{group_id}/jobs")),
             )
@@ -465,6 +561,7 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     async fn get_job_group_build_results(
         &self,
         Parameters(BuildResults {
+            server,
             group_id,
             limit_builds,
             time_limit_days,
@@ -473,13 +570,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
         }): Parameters<BuildResults>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let path = Query::new()
             .push("limit_builds", limit_builds)
             .push("time_limit_days", time_limit_days)
             .push("only_tagged", only_tagged)
             .push("show_tags", show_tags)
             .finish(&api(&format!("job_groups/{group_id}/build_results")));
-        to_result(self.request_json(&ctx, Method::GET, &path).await)
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(
@@ -488,10 +586,12 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_parent_groups(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api("parent_groups"))
+            self.request_json(&ctx, client, Method::GET, &api("parent_groups"))
                 .await,
         )
     }
@@ -502,12 +602,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_parent_group(
         &self,
-        Parameters(GroupId { group_id }): Parameters<GroupId>,
+        Parameters(GroupId { server, group_id }): Parameters<GroupId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::GET,
                 &api(&format!("parent_groups/{group_id}")),
             )
@@ -521,9 +623,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_assets(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        to_result(self.request_json(&ctx, Method::GET, &api("assets")).await)
+        let client = self.resolve_server(&server)?;
+        to_result(
+            self.request_json(&ctx, client, Method::GET, &api("assets"))
+                .await,
+        )
     }
 
     #[tool(
@@ -532,12 +639,18 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_asset(
         &self,
-        Parameters(AssetId { asset_id }): Parameters<AssetId>,
+        Parameters(AssetId { server, asset_id }): Parameters<AssetId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api(&format!("assets/{asset_id}")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("assets/{asset_id}")),
+            )
+            .await,
         )
     }
 
@@ -547,9 +660,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_workers(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        to_result(self.request_json(&ctx, Method::GET, &api("workers")).await)
+        let client = self.resolve_server(&server)?;
+        to_result(
+            self.request_json(&ctx, client, Method::GET, &api("workers"))
+                .await,
+        )
     }
 
     #[tool(
@@ -558,9 +676,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_bugs(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        to_result(self.request_json(&ctx, Method::GET, &api("bugs")).await)
+        let client = self.resolve_server(&server)?;
+        to_result(
+            self.request_json(&ctx, client, Method::GET, &api("bugs"))
+                .await,
+        )
     }
 
     #[tool(
@@ -569,13 +692,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn search(
         &self,
-        Parameters(Search { q }): Parameters<Search>,
+        Parameters(Search { server, q }): Parameters<Search>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let path = Query::new()
             .push("q", Some(q))
             .finish(&api("experimental/search"));
-        to_result(self.request_json(&ctx, Method::GET, &path).await)
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(
@@ -585,13 +709,16 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     async fn get_scheduled_product(
         &self,
         Parameters(ScheduledProductId {
+            server,
             scheduled_product_id,
         }): Parameters<ScheduledProductId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::GET,
                 &api(&format!("isos/{scheduled_product_id}")),
             )
@@ -605,10 +732,12 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_iso_job_stats(
         &self,
+        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::GET, &api("isos/job_stats"))
+            self.request_json(&ctx, client, Method::GET, &api("isos/job_stats"))
                 .await,
         )
     }
@@ -619,12 +748,14 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_group_comments(
         &self,
-        Parameters(GroupId { group_id }): Parameters<GroupId>,
+        Parameters(GroupId { server, group_id }): Parameters<GroupId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::GET,
                 &api(&format!("groups/{group_id}/comments")),
             )
@@ -638,12 +769,17 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_parent_group_comments(
         &self,
-        Parameters(ParentGroupId { parent_group_id }): Parameters<ParentGroupId>,
+        Parameters(ParentGroupId {
+            server,
+            parent_group_id,
+        }): Parameters<ParentGroupId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::GET,
                 &api(&format!("parent_groups/{parent_group_id}/comments")),
             )
@@ -659,18 +795,27 @@ autoinst-log.txt or a supportconfig .txz. Pass a name to `get_job_log`, or to \
     )]
     async fn list_job_logs(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let ajax_path = format!("/tests/{job_id}/downloads_ajax");
-        if let Ok(Value::String(html)) = self.request_json(&ctx, Method::GET, &ajax_path).await {
+        if let Ok(Value::String(html)) = self
+            .request_json(&ctx, client, Method::GET, &ajax_path)
+            .await
+        {
             let files = artifact::parse_downloads(&html, job_id);
             if !files.is_empty() {
                 return ok(json!({"source": "downloads_ajax", "files": files}));
             }
         }
         match self
-            .request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/details")))
+            .request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("jobs/{job_id}/details")),
+            )
             .await
         {
             Ok(value) => ok(json!({
@@ -688,12 +833,17 @@ the files inside a supportconfig .txz. Pass one entry's `path` as `member` to `g
     )]
     async fn list_job_log_members(
         &self,
-        Parameters(JobLogFile { job_id, filename }): Parameters<JobLogFile>,
+        Parameters(JobLogFile {
+            server,
+            job_id,
+            filename,
+        }): Parameters<JobLogFile>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         artifact::validate_filename(&filename)?;
         let probe = match artifact::probe(
-            &self.client,
+            client,
             &ctx,
             job_id,
             &filename,
@@ -706,7 +856,7 @@ the files inside a supportconfig .txz. Pass one entry's `path` as `member` to `g
             Err(bail) => return bail,
         };
         let content = match artifact::fetch_decoded(
-            &self.client,
+            client,
             &ctx,
             job_id,
             &filename,
@@ -736,6 +886,7 @@ refused with an `unsupported_media` error.",
     async fn get_job_log(
         &self,
         Parameters(GetJobLog {
+            server,
             job_id,
             filename,
             member,
@@ -747,6 +898,7 @@ refused with an `unsupported_media` error.",
         }): Parameters<GetJobLog>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         artifact::validate_filename(&filename)?;
         if let Some(member) = &member {
             artifact::validate_member(member)?;
@@ -755,36 +907,22 @@ refused with an `unsupported_media` error.",
         let context_lines = context_lines.unwrap_or(0);
         let max_matches = max_matches.unwrap_or(artifact::DEFAULT_MAX_MATCHES);
 
-        let probe = match artifact::probe(
-            &self.client,
-            &ctx,
-            job_id,
-            &filename,
-            PROBE_BYTES,
-            ceiling,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(bail) => return bail,
-        };
+        let probe =
+            match artifact::probe(client, &ctx, job_id, &filename, PROBE_BYTES, ceiling).await {
+                Ok(p) => p,
+                Err(bail) => return bail,
+            };
         let needs_full_decode =
             member.is_some() || artifact::sniff(&probe.body) != artifact::Sniff::Plain;
 
         let (raw_text, transferred, size, changed_during_read) = if needs_full_decode {
-            let content = match artifact::fetch_decoded(
-                &self.client,
-                &ctx,
-                job_id,
-                &filename,
-                &probe,
-                ceiling,
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(bail) => return bail,
-            };
+            let content =
+                match artifact::fetch_decoded(client, &ctx, job_id, &filename, &probe, ceiling)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(bail) => return bail,
+                };
             let final_bytes = if let Some(member) = &member {
                 match artifact::extract_tar_member(&content, member, ceiling) {
                     Ok(b) => b,
@@ -810,13 +948,7 @@ refused with an `unsupported_media` error.",
                 Some(n) if !probe.complete => {
                     let window = artifact::tail_window(n, probe.size, ceiling as u64);
                     let tail = match artifact::fetch_tail(
-                        &self.client,
-                        &ctx,
-                        job_id,
-                        &filename,
-                        &probe,
-                        window,
-                        ceiling,
+                        client, &ctx, job_id, &filename, &probe, window, ceiling,
                     )
                     .await
                     {
@@ -840,9 +972,7 @@ refused with an `unsupported_media` error.",
                     let raw = if probe.complete {
                         probe.body.clone()
                     } else {
-                        match artifact::fetch_all(&self.client, &ctx, job_id, &filename, ceiling)
-                            .await
-                        {
+                        match artifact::fetch_all(client, &ctx, job_id, &filename, ceiling).await {
                             Ok(b) => b,
                             Err(bail) => return bail,
                         }
@@ -897,12 +1027,14 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
     async fn get_job_log_errors(
         &self,
         Parameters(GetJobLogErrors {
+            server,
             job_id,
             markers,
             filename,
         }): Parameters<GetJobLogErrors>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         if let Some(name) = &filename {
             artifact::validate_filename(name)?;
         }
@@ -917,16 +1049,21 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
         // `failed_modules` and no serial_terminal.txt probe-skip, never an
         // aborted digest.
         let details = self
-            .request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/details")))
+            .request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("jobs/{job_id}/details")),
+            )
             .await
             .ok();
         let failed_modules = details
             .as_ref()
-            .map(|v| artifact::failed_modules(v, job_id, self.client.base_url()));
+            .map(|v| artifact::failed_modules(v, job_id, client.base_url()));
 
         if let Some(set) = &custom_set {
             let text = match artifact::fetch_text_lossy(
-                &self.client,
+                client,
                 &ctx,
                 job_id,
                 &scan_file,
@@ -953,7 +1090,7 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
                 .is_some_and(|v| artifact::has_log(v, "serial_terminal.txt"));
             if has_serial {
                 let text = match artifact::fetch_text_lossy(
-                    &self.client,
+                    client,
                     &ctx,
                     job_id,
                     "serial_terminal.txt",
@@ -982,18 +1119,13 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
             }
         }
 
-        let text = match artifact::fetch_text_lossy(
-            &self.client,
-            &ctx,
-            job_id,
-            &scan_file,
-            MAX_ARTIFACT_BYTES,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(bail) => return bail,
-        };
+        let text =
+            match artifact::fetch_text_lossy(client, &ctx, job_id, &scan_file, MAX_ARTIFACT_BYTES)
+                .await
+            {
+                Ok(t) => t,
+                Err(bail) => return bail,
+            };
 
         let died = artifact::scan_markers(
             &text,
@@ -1034,6 +1166,15 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
             total_lines: text.lines().count(),
         };
         digest_reply(job_id, "tail", &scan_file, &scan, failed_modules)
+    }
+
+    #[tool(
+        description = "List the openQA servers this MCP instance is configured to talk to. Every \
+other tool's `server` argument must be one of these values.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_servers(&self) -> Result<CallToolResult, ErrorData> {
+        ok(json!({ "servers": self.servers.identifiers() }))
     }
 }
 
