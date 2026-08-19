@@ -737,13 +737,17 @@ pub(crate) static NOISE_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // Excludes the ubiquitous `timeout=<n>` keyword argument that
         // `testapi::wait_serial`/`assert_screen`/`type_string` log on nearly
-        // every debug line: on a real timeout job that's 20000+ false
-        // matches burying the one real line (live-checked on job 23938357:
-        // 23006 matches for "timeout", 23003 of them `timeout=`) past
-        // `DIGEST_MAX_HITS`, so the actual cause never appears in `hits`.
-        // The `regex` crate has no lookaround, so the exclusion is a
-        // trailing "not '=', or end of line" group instead.
-        r"(?i)\btimed? ?out(?:[^=]|$)",
+        // every debug line (20000+ false matches burying the one real line
+        // on job 23938357) and the `--timeout <n>` CLI-flag form every
+        // job's startup `rsync -avHP --timeout 1800 ...` line also matches
+        // (confirmed present verbatim in every autoinst-log.txt checked).
+        // The `regex` crate has no lookaround, so both exclusions are
+        // consuming alternatives instead: end of line, a non-'='/whitespace
+        // character (", ." etc.), or whitespace not followed by a digit —
+        // "timeout=undef", "timeout 1800", and "timeout=200)" all fail every
+        // branch, while "Result: timeout", "timed out, retrying", and
+        // "timeout waiting for serial" each satisfy one.
+        r"(?i)\btimed? ?out(?:$|[^=\s]|\s\D)",
         "Failed to ",
         r"(?i)\berror:",
         r"\bERROR\b",
@@ -1304,11 +1308,28 @@ mod tests {
                 .is_match(r#"<<< testapi::assert_screen(mustmatch="root-console", timeout=30)"#)
         );
         assert!(!NOISE_MARKERS.is_match("], timeout=200)"));
-        // Real timeout signals must still match: end of line, and followed
-        // by anything other than `=`.
+        assert!(!NOISE_MARKERS.is_match(r#"password="SECRET", timeout=undef, username="root""#));
+        // Real timeout signals must still match: end of line, followed by
+        // punctuation, or followed by whitespace and a non-digit word.
         assert!(NOISE_MARKERS.is_match("Result: timeout"));
         assert!(NOISE_MARKERS.is_match("connection timed out, retrying"));
         assert!(NOISE_MARKERS.is_match("the operation timed out."));
+        assert!(NOISE_MARKERS.is_match("timeout waiting for serial"));
+    }
+
+    #[test]
+    fn noise_markers_timeout_ignores_the_cli_flag_form() {
+        // Every job's autoinst-log.txt opens with this exact rsync call
+        // (confirmed verbatim across every job checked); `--timeout 1800`
+        // is a CLI flag/value pair, not a failure, and would otherwise be
+        // the very first (and often only) "generic" tier hit on every job,
+        // including ones with no real error at all.
+        assert!(!NOISE_MARKERS.is_match(
+            "[info] [#2009] Calling: rsync -avHP --timeout 1800 rsync://openqa.suse.de/tests/"
+        ));
+        // A genuine dracut timeout message must still match even though it
+        // is also followed by punctuation rather than whitespace.
+        assert!(NOISE_MARKERS.is_match("dracut-initqueue: timeout, still waiting for"));
     }
 
     #[test]
