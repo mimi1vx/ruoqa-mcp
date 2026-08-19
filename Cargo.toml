@@ -43,6 +43,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 lzma-rs = "0.3"
 tar = { version = "0.4", default-features = false }
 regex = "1"
+url = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -9,9 +9,11 @@ pub mod heartbeat;
 pub mod http;
 pub mod query;
 pub mod server;
+pub mod servers;
 pub mod summary;
 pub mod tools;
 
 pub use cli::Cli;
 pub use config::{EnvConfig, build_client};
 pub use server::OpenQaServer;
+pub use servers::{ServerConfigError, ServerRegistry};
