@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.2...v0.4.0) - 2026-08-19
+
+### Added
+
+- [**breaking**] require a server argument on every tool, add list_servers (gh#3)
+- parse OPENQA_SERVER as a list and add ServerRegistry (gh#3)
+- add get_job_log_errors, a tiered failure digest over a job's logs
+
+### Fixed
+
+- exclude the --timeout <n> CLI-flag form from the noise marker
+- stop timeout marker false-positives, catch worker-level verdicts
+- report the artefact total, not the tail window, in unsupported_media
+
+### Other
+
+- note list_job_logs covers logs and ulogs only, not assets
+
 ## [0.3.2](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.1...v0.3.2) - 2026-08-18
 
 ### Added
