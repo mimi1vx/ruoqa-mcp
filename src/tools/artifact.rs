@@ -706,7 +706,15 @@ fn grep_lines(text: &str, re: &Regex, context_lines: usize, max_matches: usize) 
 //      result only here (TINFO/TFAIL/TBROK, LTP's own TAP-like convention),
 //      never in autoinst-log.txt.
 //   2. FATAL_MARKERS in autoinst-log.txt — the literal "# Test died:"
-//      os-autoinst itself writes when a module dies.
+//      os-autoinst itself writes when a module dies, plus the worker's own
+//      terminal verdict line (`Result: <reason>`, `OpenQA::Constants`'
+//      `WORKER_SR_*` enum) for the abnormal-termination reasons that never
+//      go through a module death at all — e.g. an asset failing to
+//      download before any module runs logs only `Result: setup failure`.
+//      `done`/`finish-off` are deliberately excluded: `done` means the
+//      worker exited normally (a job can still fail at the module level
+//      with `Result: done` in its log), and `finish-off` is a graceful
+//      worker shutdown, not a failure.
 //   3. NOISE_MARKERS in autoinst-log.txt — fallback only.
 // Ported from reviewpc's `lib/oqa-fetch.mjs` (TAP_MARKERS/FATAL_MARKERS/
 // NOISE_MARKERS), with each pattern's `/i` flag inlined as `(?i)` for
@@ -714,11 +722,28 @@ fn grep_lines(text: &str, re: &Regex, context_lines: usize, max_matches: usize) 
 pub(crate) static TAP_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([r"\bTFAIL\b", r"\bTBROK\b", r"^not ok"]).expect("static regex set")
 });
-pub(crate) static FATAL_MARKERS: LazyLock<RegexSet> =
-    LazyLock::new(|| RegexSet::new(["Test died", r"(?i)\bdied\b"]).expect("static regex set"));
+pub(crate) static FATAL_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        "Test died",
+        r"(?i)\bdied\b",
+        "Result: setup failure",
+        "Result: api-failure",
+        "Result: worker broken",
+        "Result: timeout",
+    ])
+    .expect("static regex set")
+});
 pub(crate) static NOISE_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
-        r"(?i)timed? ?out",
+        // Excludes the ubiquitous `timeout=<n>` keyword argument that
+        // `testapi::wait_serial`/`assert_screen`/`type_string` log on nearly
+        // every debug line: on a real timeout job that's 20000+ false
+        // matches burying the one real line (live-checked on job 23938357:
+        // 23006 matches for "timeout", 23003 of them `timeout=`) past
+        // `DIGEST_MAX_HITS`, so the actual cause never appears in `hits`.
+        // The `regex` crate has no lookaround, so the exclusion is a
+        // trailing "not '=', or end of line" group instead.
+        r"(?i)\btimed? ?out(?:[^=]|$)",
         "Failed to ",
         r"(?i)\berror:",
         r"\bERROR\b",
@@ -729,9 +754,8 @@ pub(crate) static NOISE_MARKERS: LazyLock<RegexSet> = LazyLock::new(|| {
 
 /// When true, every tier's reply also carries the tail (the reference
 /// implementation's behaviour); when false (the default — a tier match
-/// means the tail's file may never even have been fetched, see the plan's
-/// deviation note), the `tail` tier only fires on its own, once nothing
-/// else matched.
+/// means the tail's file may never even have been fetched), the `tail`
+/// tier only fires on its own, once nothing else matched.
 pub(crate) const TAIL_ALWAYS: bool = false;
 
 /// Compiles each `markers` pattern individually first (so a bad one is
@@ -1236,6 +1260,26 @@ mod tests {
     }
 
     #[test]
+    fn fatal_markers_match_the_workers_own_terminal_verdict_lines() {
+        // The worker's own `Result: <reason>` line (OpenQA::Constants'
+        // WORKER_SR_* enum) for abnormal terminations that never go through
+        // a module death at all, e.g. an asset failing to download.
+        assert!(FATAL_MARKERS.is_match("[info] [pid:1] Result: setup failure"));
+        assert!(FATAL_MARKERS.is_match("[info] [pid:1] Result: api-failure"));
+        assert!(FATAL_MARKERS.is_match("[info] [pid:1] Result: worker broken"));
+        assert!(FATAL_MARKERS.is_match("[info] [pid:1] Result: timeout"));
+    }
+
+    #[test]
+    fn fatal_markers_do_not_match_a_normal_exit() {
+        // `done` means the worker exited normally (a job can still fail at
+        // the module level with `Result: done` in its log); `finish-off` is
+        // a graceful shutdown. Neither is a failure signal.
+        assert!(!FATAL_MARKERS.is_match("[info] [pid:1] Result: done"));
+        assert!(!FATAL_MARKERS.is_match("[info] [pid:1] Result: finish-off"));
+    }
+
+    #[test]
     fn noise_markers_error_colon_is_case_insensitive_but_bare_error_is_not() {
         // `error:` alone only matches the case-insensitive `(?i)\berror:` member.
         assert!(NOISE_MARKERS.is_match("connection error: refused"));
@@ -1247,6 +1291,24 @@ mod tests {
         assert!(NOISE_MARKERS.is_match("timeout waiting for serial"));
         assert!(NOISE_MARKERS.is_match("Failed to connect"));
         assert!(NOISE_MARKERS.is_match("command ssh failed"));
+    }
+
+    #[test]
+    fn noise_markers_timeout_ignores_the_keyword_argument() {
+        // Live-checked on a real timeout job (23938357): 23006 lines match
+        // a bare `timed? ?out`, and 23003 of them are just the `timeout=`
+        // kwarg testapi logs on nearly every debug line, burying the one
+        // real line ("Result: timeout") past DIGEST_MAX_HITS.
+        assert!(
+            !NOISE_MARKERS
+                .is_match(r#"<<< testapi::assert_screen(mustmatch="root-console", timeout=30)"#)
+        );
+        assert!(!NOISE_MARKERS.is_match("], timeout=200)"));
+        // Real timeout signals must still match: end of line, and followed
+        // by anything other than `=`.
+        assert!(NOISE_MARKERS.is_match("Result: timeout"));
+        assert!(NOISE_MARKERS.is_match("connection timed out, retrying"));
+        assert!(NOISE_MARKERS.is_match("the operation timed out."));
     }
 
     #[test]
