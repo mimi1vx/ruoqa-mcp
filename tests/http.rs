@@ -253,7 +253,7 @@ async fn write_token_keeps_the_full_tool_set() {
     let client = connect(addr, Some(WRITE_TOKEN)).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 42);
+    assert_eq!(tools.len(), 43);
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
     params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());
@@ -271,7 +271,7 @@ async fn read_token_sees_and_reaches_only_read_tools() {
     let client = connect(addr, Some(READ_TOKEN)).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 29);
     assert!(!tools.iter().any(|t| t.name == "cancel_job"));
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
@@ -331,7 +331,7 @@ async fn insecure_no_auth_serves_anonymous_write_calls() {
     let client = connect(addr, None).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 42);
+    assert_eq!(tools.len(), 43);
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
     params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());

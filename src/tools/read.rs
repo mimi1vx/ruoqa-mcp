@@ -1,4 +1,4 @@
-//! The 28 read tools (port of the READ section of `server.py`, plus the job-
+//! The 29 read tools (port of the READ section of `server.py`, plus the job-
 //! log-artifact tools that have no equivalent there).
 
 use reqwest::Method;
@@ -15,7 +15,10 @@ use crate::query::{Query, api};
 use crate::server::{OpenQaServer, ok, to_result};
 use crate::summary::summarize_jobs;
 use crate::tools::artifact;
-use crate::tools::{MAX_ARCHIVE_MEMBERS, MAX_ARTIFACT_BYTES, MAX_IDS, PROBE_BYTES, bounded};
+use crate::tools::{
+    DIGEST_CONTEXT_LINES, DIGEST_MAX_HITS, DIGEST_TAIL_LINES, MAX_ARCHIVE_MEMBERS,
+    MAX_ARTIFACT_BYTES, MAX_IDS, PROBE_BYTES, bounded,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListJobsArgs {
@@ -177,6 +180,20 @@ pub struct GetJobLog {
     /// count is still reported as `total_matches`. Ignored without `grep`.
     #[serde(default)]
     pub max_matches: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetJobLogErrors {
+    pub job_id: i64,
+    /// Regex patterns that replace the whole tier chain: scans `filename`
+    /// (default `autoinst-log.txt`) for any of these instead, still falling
+    /// back to `tail` when none match.
+    #[serde(default)]
+    pub markers: Option<Vec<String>>,
+    /// File to scan for tiers 2-4 instead of `autoinst-log.txt`. Skips the
+    /// `serial_terminal.txt` tier, which is tied to that one file.
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// Pull the `jobs` array a summary is built from, rejecting any shape other
@@ -866,4 +883,192 @@ refused with an `unsupported_media` error.",
         }
         ok(reply)
     }
+
+    #[tool(
+        description = "Digest a job's logs down to the failure signal instead of returning the \
+whole file. Checks, in order: `serial_terminal.txt` for LTP/TAP-style TFAIL/TBROK (the real \
+verdict for serial-console-driven frameworks, never duplicated into autoinst-log.txt); \
+autoinst-log.txt for \"Test died\"; a generic error/timeout fallback; finally just the tail. The \
+first tier that matches wins. Pass `markers` (a list of regexes) to scan `filename` (default \
+autoinst-log.txt) for something else entirely instead of the tier chain. Also names the failing \
+test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort `/details` fetch.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_job_log_errors(
+        &self,
+        Parameters(GetJobLogErrors {
+            job_id,
+            markers,
+            filename,
+        }): Parameters<GetJobLogErrors>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(name) = &filename {
+            artifact::validate_filename(name)?;
+        }
+        let custom_set = match &markers {
+            Some(patterns) => Some(artifact::compile_markers(patterns)?),
+            None => None,
+        };
+        let filename_given = filename.is_some();
+        let scan_file = filename.unwrap_or_else(|| "autoinst-log.txt".to_string());
+
+        // Best-effort: a failed `/details` fetch just means no
+        // `failed_modules` and no serial_terminal.txt probe-skip, never an
+        // aborted digest.
+        let details = self
+            .request_json(&ctx, Method::GET, &api(&format!("jobs/{job_id}/details")))
+            .await
+            .ok();
+        let failed_modules = details
+            .as_ref()
+            .map(|v| artifact::failed_modules(v, job_id, self.client.base_url()));
+
+        if let Some(set) = &custom_set {
+            let text = match artifact::fetch_text_lossy(
+                &self.client,
+                &ctx,
+                job_id,
+                &scan_file,
+                MAX_ARTIFACT_BYTES,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(bail) => return bail,
+            };
+            let scan = artifact::scan_markers(&text, set, DIGEST_CONTEXT_LINES, DIGEST_MAX_HITS);
+            return digest_reply(
+                job_id,
+                "custom",
+                &scan_file,
+                &with_tail(scan, &text),
+                failed_modules,
+            );
+        }
+
+        if !filename_given {
+            let has_serial = details
+                .as_ref()
+                .is_some_and(|v| artifact::has_log(v, "serial_terminal.txt"));
+            if has_serial {
+                let text = match artifact::fetch_text_lossy(
+                    &self.client,
+                    &ctx,
+                    job_id,
+                    "serial_terminal.txt",
+                    MAX_ARTIFACT_BYTES,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(bail) => return bail,
+                };
+                let scan = artifact::scan_markers(
+                    &text,
+                    &artifact::TAP_MARKERS,
+                    DIGEST_CONTEXT_LINES,
+                    DIGEST_MAX_HITS,
+                );
+                if scan.hit_count > 0 {
+                    return digest_reply(
+                        job_id,
+                        "tap",
+                        "serial_terminal.txt",
+                        &with_tail(scan, &text),
+                        failed_modules,
+                    );
+                }
+            }
+        }
+
+        let text = match artifact::fetch_text_lossy(
+            &self.client,
+            &ctx,
+            job_id,
+            &scan_file,
+            MAX_ARTIFACT_BYTES,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(bail) => return bail,
+        };
+
+        let died = artifact::scan_markers(
+            &text,
+            &artifact::FATAL_MARKERS,
+            DIGEST_CONTEXT_LINES,
+            DIGEST_MAX_HITS,
+        );
+        if died.hit_count > 0 {
+            return digest_reply(
+                job_id,
+                "test_died",
+                &scan_file,
+                &with_tail(died, &text),
+                failed_modules,
+            );
+        }
+
+        let generic = artifact::scan_markers(
+            &text,
+            &artifact::NOISE_MARKERS,
+            DIGEST_CONTEXT_LINES,
+            DIGEST_MAX_HITS,
+        );
+        if generic.hit_count > 0 {
+            return digest_reply(
+                job_id,
+                "generic",
+                &scan_file,
+                &with_tail(generic, &text),
+                failed_modules,
+            );
+        }
+
+        let scan = artifact::ScanResult {
+            hits: artifact::tail_hits(&text, DIGEST_TAIL_LINES),
+            hit_count: 0,
+            more_hits: false,
+            total_lines: text.lines().count(),
+        };
+        digest_reply(job_id, "tail", &scan_file, &scan, failed_modules)
+    }
+}
+
+/// Appends the tail to `scan`'s hits when [`artifact::TAIL_ALWAYS`] is
+/// flipped on; a no-op by default (see its doc comment).
+fn with_tail(mut scan: artifact::ScanResult, text: &str) -> artifact::ScanResult {
+    if artifact::TAIL_ALWAYS {
+        scan.hits
+            .extend(artifact::tail_hits(text, DIGEST_TAIL_LINES));
+    }
+    scan
+}
+
+/// Builds `get_job_log_errors`'s reply; `failed_modules` is omitted when the
+/// `/details` fetch failed or found no failed/softfailed module.
+fn digest_reply(
+    job_id: i64,
+    tier: &str,
+    source: &str,
+    scan: &artifact::ScanResult,
+    failed_modules: Option<Vec<artifact::FailedModule>>,
+) -> Result<CallToolResult, ErrorData> {
+    let mut reply = json!({
+        "job_id": job_id,
+        "tier": tier,
+        "source": source,
+        "total_lines": scan.total_lines,
+        "hits": scan.hits,
+        "hit_count": scan.hit_count,
+        "more_hits": scan.more_hits,
+    });
+    if let Some(modules) = failed_modules
+        && !modules.is_empty()
+    {
+        reply["failed_modules"] = json!(modules);
+    }
+    ok(reply)
 }

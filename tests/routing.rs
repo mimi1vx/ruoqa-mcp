@@ -1,4 +1,4 @@
-//! Table-driven request-shape check for all 42 registered tools: method,
+//! Table-driven request-shape check for all 43 registered tools: method,
 //! path, query string, and body/form-encoding. `tests/tools.rs` asserts
 //! response handling and edge cases; this file asserts only where and how
 //! each tool's request goes out, so a typo'd `format!` path or a `GET` where
@@ -11,7 +11,7 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use ruoqa_mcp::OpenQaServer;
 use serde_json::{Value, json};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn run_server(mock: &MockServer) -> RunningService<RoleClient, ()> {
@@ -415,7 +415,9 @@ fn cases() -> Vec<Case> {
 /// request (falling back to `/details`) whenever the first response isn't
 /// recognizable HTML, which the shared `any()` mock never produces, so it
 /// can't satisfy this file's exactly-one-request-per-case assumption.
-const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs"];
+/// `get_job_log_errors` issues a `/details` fetch plus a conditional number
+/// of tier fetches, same problem.
+const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs", "get_job_log_errors"];
 
 /// Names covered by [`cases`] plus [`COVERED_OUTSIDE_MATRIX`], for the
 /// coverage-ratchet guard test below.
@@ -565,4 +567,37 @@ async fn list_job_logs_requests_downloads_ajax_first() {
     let first = requests.first().expect("at least one request");
     assert_eq!(first.method.as_str(), "GET");
     assert_eq!(first.url.path(), "/tests/42/downloads_ajax");
+}
+
+/// `get_job_log_errors` fetches `/details` first, then probes
+/// `serial_terminal.txt` (present in `/details`'s `logs`); a tier-1 hit must
+/// never go on to fetch `autoinst-log.txt` at all.
+#[tokio::test]
+async fn get_job_log_errors_requests_details_then_serial_terminal_and_skips_autoinst_on_tap_hit() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/50/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt", "serial_terminal.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/50/file/serial_terminal.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("nice05.c:138: TFAIL: bad\n"))
+        .mount(&mock)
+        .await;
+    let client = run_server(&mock).await;
+
+    call(&client, "get_job_log_errors", &json!({"job_id": 50})).await;
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    assert_eq!(requests[0].url.path(), "/api/v1/jobs/50/details");
+    assert_eq!(requests[1].url.path(), "/tests/50/file/serial_terminal.txt");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.url.path() != "/tests/50/file/autoinst-log.txt"),
+        "a tap-tier hit must never fetch autoinst-log.txt: {requests:?}"
+    );
 }
