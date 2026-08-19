@@ -51,12 +51,22 @@ fn alias_for(url: &url::Url) -> Option<&'static str> {
 
 /// A resolved set of `ruoqa::Client`s, keyed by every selector a tool's
 /// `server` argument may name (canonical `host[:port]` plus any alias).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerRegistry {
     clients: HashMap<String, ruoqa::Client>,
 }
 
 impl ServerRegistry {
+    /// Build a registry directly from pre-resolved clients, bypassing
+    /// `OPENQA_SERVER` parsing. Exists for test harnesses that need a fixed,
+    /// known selector (e.g. a mock-backed client under `"test"`) rather than
+    /// going through `build_registry`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_map(clients: HashMap<String, ruoqa::Client>) -> Self {
+        Self { clients }
+    }
+
     #[must_use]
     pub fn resolve(&self, selector: &str) -> Option<&ruoqa::Client> {
         self.clients.get(selector)

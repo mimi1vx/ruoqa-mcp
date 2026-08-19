@@ -16,8 +16,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 use rmcp::{ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt};
-use ruoqa_mcp::OpenQaServer;
 use ruoqa_mcp::http::{HttpAuth, HttpEnv, allowed_hosts, router};
+use ruoqa_mcp::{OpenQaServer, ServerRegistry};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
@@ -125,8 +125,11 @@ fn openqa_router(
         .api_secret(ruoqa::ApiSecret::new("secret"))
         .build()
         .expect("build client");
+    let mut clients = std::collections::HashMap::new();
+    clients.insert("test".to_string(), client);
     let auth = HttpAuth::resolve(env, insecure).expect("resolve auth");
-    let server = OpenQaServer::new(client, false).with_scope_enforcement(!auth.is_insecure());
+    let server = OpenQaServer::new(ServerRegistry::from_map(clients), false)
+        .with_scope_enforcement(!auth.is_insecure());
     router(
         server,
         Arc::new(auth),
@@ -253,10 +256,15 @@ async fn write_token_keeps_the_full_tool_set() {
     let client = connect(addr, Some(WRITE_TOKEN)).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 43);
+    assert_eq!(tools.len(), 44);
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
-    params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());
+    params = params.with_arguments(
+        json!({"job_id": 7, "server": "test"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     client.peer().call_tool(params).await.expect("cancel_job");
 
     let requests = mock.received_requests().await.expect("requests");
@@ -271,11 +279,16 @@ async fn read_token_sees_and_reaches_only_read_tools() {
     let client = connect(addr, Some(READ_TOKEN)).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 29);
+    assert_eq!(tools.len(), 30);
     assert!(!tools.iter().any(|t| t.name == "cancel_job"));
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
-    params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());
+    params = params.with_arguments(
+        json!({"job_id": 7, "server": "test"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     let error = client
         .peer()
         .call_tool(params)
@@ -291,7 +304,12 @@ async fn read_token_sees_and_reaches_only_read_tools() {
     );
 
     let mut params = CallToolRequestParams::new("get_job".to_string());
-    params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());
+    params = params.with_arguments(
+        json!({"job_id": 7, "server": "test"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     client.peer().call_tool(params).await.expect("get_job");
     assert_eq!(mock.received_requests().await.expect("requests").len(), 1);
 }
@@ -331,10 +349,15 @@ async fn insecure_no_auth_serves_anonymous_write_calls() {
     let client = connect(addr, None).await.expect("handshake");
 
     let tools = client.peer().list_all_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 43);
+    assert_eq!(tools.len(), 44);
 
     let mut params = CallToolRequestParams::new("cancel_job".to_string());
-    params = params.with_arguments(json!({"job_id": 7}).as_object().unwrap().clone());
+    params = params.with_arguments(
+        json!({"job_id": 7, "server": "test"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     client.peer().call_tool(params).await.expect("cancel_job");
     assert_eq!(mock.received_requests().await.expect("requests").len(), 1);
 }

@@ -7,10 +7,15 @@ use std::time::Duration;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
-use ruoqa_mcp::OpenQaServer;
+use ruoqa_mcp::{OpenQaServer, ServerRegistry};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+/// The fixed `server` id every test's mock-backed client is registered
+/// under; `call()` injects it into any argument object that doesn't already
+/// name one.
+const TEST_SERVER: &str = "test";
 
 async fn server_with_mock(mock: &MockServer, readonly: bool) -> RunningService<RoleClient, ()> {
     server_with_client(mock, readonly, None, None).await
@@ -61,7 +66,9 @@ async fn run_server_at(
             .api_secret(ruoqa::ApiSecret::new(secret));
     }
     let client = builder.build().expect("build client");
-    let mut server = OpenQaServer::new(client, readonly);
+    let mut clients = std::collections::HashMap::new();
+    clients.insert(TEST_SERVER.to_string(), client);
+    let mut server = OpenQaServer::new(ServerRegistry::from_map(clients), readonly);
     if let Some(timeout) = call_timeout {
         server = server.with_call_timeout(Some(timeout));
     }
@@ -81,10 +88,10 @@ async fn call(
     name: &str,
     args: Value,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
-    let mut params = CallToolRequestParams::new(name.to_string());
-    if let Some(obj) = args.as_object() {
-        params = params.with_arguments(obj.clone());
-    }
+    let mut obj = args.as_object().cloned().unwrap_or_default();
+    obj.entry("server".to_string())
+        .or_insert_with(|| json!(TEST_SERVER));
+    let params = CallToolRequestParams::new(name.to_string()).with_arguments(obj);
     client.peer().call_tool(params).await
 }
 
@@ -984,6 +991,19 @@ async fn readonly_server_does_not_expose_mutating_tools() {
         .expect_err("readonly server has no write tools");
 
     assert!(matches!(err, rmcp::ServiceError::McpError(_)));
+}
+
+#[tokio::test]
+async fn list_servers_lists_the_test_fixture_id_with_no_arguments() {
+    let mock = MockServer::start().await;
+    let client = server_with_mock(&mock, true).await;
+
+    let mut params = CallToolRequestParams::new("list_servers".to_string());
+    params = params.with_arguments(serde_json::Map::new());
+    let result = client.peer().call_tool(params).await.expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["servers"], json!([TEST_SERVER]));
 }
 
 // --- Job-artifact tools -----------------------------------------------
@@ -1897,5 +1917,87 @@ async fn get_job_log_errors_bad_marker_regex_is_invalid_params() {
     assert!(
         mock.received_requests().await.expect("requests").is_empty(),
         "a bad marker pattern must send no HTTP request"
+    );
+}
+
+#[tokio::test]
+async fn unknown_server_returns_invalid_params() {
+    let mock = MockServer::start().await;
+    let client = server_with_mock(&mock, true).await;
+
+    let err = call(&client, "list_jobs", json!({"server": "does-not-exist"}))
+        .await
+        .expect_err("unknown server must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(
+        mcp_err.message.contains("does-not-exist"),
+        "{}",
+        mcp_err.message
+    );
+    assert!(mcp_err.message.contains(TEST_SERVER), "{}", mcp_err.message);
+    assert!(
+        mock.received_requests().await.expect("requests").is_empty(),
+        "an unrecognized server must send no HTTP request"
+    );
+}
+
+#[tokio::test]
+async fn two_servers_route_independently() {
+    let mock_one = MockServer::start().await;
+    let mock_two = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"job": {"id": 1, "from": "one"}})),
+        )
+        .mount(&mock_one)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"job": {"id": 1, "from": "two"}})),
+        )
+        .mount(&mock_two)
+        .await;
+
+    let mut clients = std::collections::HashMap::new();
+    for (id, mock) in [("one", &mock_one), ("two", &mock_two)] {
+        let client = ruoqa::ClientBuilder::new()
+            .server(mock.uri())
+            .config_paths(vec![])
+            .build()
+            .expect("build client");
+        clients.insert(id.to_string(), client);
+    }
+    let server = OpenQaServer::new(ServerRegistry::from_map(clients), false);
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_transport).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client = ().serve(client_transport).await.expect("client handshake");
+
+    let one = call(&client, "get_job", json!({"job_id": 1, "server": "one"}))
+        .await
+        .expect("call_tool");
+    assert_eq!(text(&one)["job"]["from"], "one");
+
+    let two = call(&client, "get_job", json!({"job_id": 1, "server": "two"}))
+        .await
+        .expect("call_tool");
+    assert_eq!(text(&two)["job"]["from"], "two");
+
+    assert_eq!(
+        mock_one.received_requests().await.expect("requests").len(),
+        1
+    );
+    assert_eq!(
+        mock_two.received_requests().await.expect("requests").len(),
+        1
     );
 }

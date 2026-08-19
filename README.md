@@ -44,15 +44,25 @@ to the openQA client config file for credentials.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPENQA_SERVER` | *(unset)* | openQA host (e.g. `openqa.opensuse.org`). Empty falls back to ruoqa's `client.conf` discovery. |
-| `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. |
-| `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. |
+| `OPENQA_SERVER` | *(unset)* | openQA host(s) (e.g. `openqa.opensuse.org`), or a comma-separated list to talk to several at once (e.g. `openqa.suse.de,openqa.opensuse.org`). Empty falls back to ruoqa's `client.conf` discovery. |
+| `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. Only valid with a single configured server — see below. |
+| `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. Only valid with a single configured server — see below. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. See the warning below before using `false`. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 | `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds a slow upstream regardless of which tool is waiting on it. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `OPENQA_API_KEY` and `OPENQA_API_SECRET` must both be set together; setting
-only one is a startup error.
+only one is a startup error. With 2 or more servers configured in
+`OPENQA_SERVER`, setting either at all is also a startup error: there is no
+way for a process-wide env var to apply to only some of the servers, so
+multi-server credentials must live in `client.conf`'s per-`[host]` sections
+instead (see [Config file](#config-file)).
+
+Every tool call takes a mandatory `server` argument naming which configured
+server to use — `openqa.suse.de` and `openqa.opensuse.org` are additionally
+selectable by the short aliases `osd` and `o3`. Call `list_servers` to see the
+full set for the running instance; with a single `OPENQA_SERVER` entry (or
+none), there is exactly one valid value.
 
 `OPENQA_VERIFY` set to a path loads that file as the **only** trusted CA
 bundle (it replaces the platform trust store rather than merging with it),
@@ -88,6 +98,9 @@ OPENQA_MCP_HTTP_TOKEN="a-token-may-be-quoted"
 EOF
 ```
 
+For more than one server, use a comma-separated list instead:
+`OPENQA_SERVER=openqa.suse.de,openqa.opensuse.org`.
+
 A variable that is already exported always wins over the file, so `~/.env`
 supplies defaults rather than overrides. Only this fixed path is read — never a
 `.env` in the working directory, because a daemon must not pick up credentials
@@ -121,8 +134,12 @@ tools get `403`).
 
 ### Read tools
 
+Every tool below also takes a mandatory `server` argument (omitted from the
+descriptions for brevity) — see [Environment variables](#environment-variables).
+
 | Tool | Description |
 | --- | --- |
+| `list_servers` | List the openQA servers this MCP instance is configured to talk to. Takes no other arguments. |
 | `list_jobs` | List jobs matching the given filters. Pass `summary=true` for a compact triage breakdown. |
 | `list_jobs_overview` | List a condensed jobs overview matching the given filters. Pass `summary=true` for a compact triage breakdown. |
 | `get_job` | Get full details for a single job. |
@@ -228,6 +245,9 @@ means that field is omitted, never an aborted digest.
 
 ### Mutating tools (require credentials)
 
+Like the read tools, every tool below also takes a mandatory `server`
+argument.
+
 | Tool | Description |
 | --- | --- |
 | `restart_jobs` | Restart the given jobs in one bulk request. |
@@ -304,6 +324,9 @@ Example MCP client configuration:
   }
 }
 ```
+
+For multiple servers, set `OPENQA_SERVER` to a comma-separated list (e.g.
+`"openqa.suse.de,openqa.opensuse.org"`) and pass `server` on every tool call.
 
 ### HTTP (optional)
 

@@ -20,6 +20,9 @@ use crate::tools::{MAX_EXTRA_ENTRIES, MAX_RESTART_JOBS, bounded};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RestartJobs {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     #[schemars(length(min = 1, max = MAX_RESTART_JOBS))]
     pub job_ids: Vec<i64>,
     #[serde(default)]
@@ -30,17 +33,26 @@ pub struct RestartJobs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobId {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobComment {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub text: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TriggerIsos {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub distri: String,
     pub version: String,
     pub flavor: String,
@@ -52,6 +64,9 @@ pub struct TriggerIsos {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DuplicateJob {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     #[serde(default)]
     pub prio: Option<i64>,
@@ -61,12 +76,18 @@ pub struct DuplicateJob {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetJobPriority {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub prio: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CancelJobs {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     #[serde(default)]
     pub state: Option<String>,
     #[serde(default)]
@@ -91,18 +112,27 @@ pub struct CancelJobs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroupComment {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub group_id: i64,
     pub text: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ParentGroupComment {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub parent_group_id: i64,
     pub text: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateJobComment {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub comment_id: i64,
     pub text: String,
@@ -110,12 +140,18 @@ pub struct UpdateJobComment {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteJobComment {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub job_id: i64,
     pub comment_id: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateBug {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub bugid: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -123,6 +159,9 @@ pub struct CreateBug {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CancelScheduledProduct {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
     pub name: String,
 }
 
@@ -190,19 +229,21 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     async fn restart_jobs(
         &self,
         Parameters(RestartJobs {
+            server,
             job_ids,
             force,
             prio,
         }): Parameters<RestartJobs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         bounded("job_ids", job_ids.len(), 1, MAX_RESTART_JOBS)?;
         let form = Form::new()
             .push_all("jobs", &job_ids)
             .push_opt("force", force)
             .push_opt("prio", prio);
         to_result(
-            self.request_form(&ctx, Method::POST, &api("jobs/restart"), &form)
+            self.request_form(&ctx, client, Method::POST, &api("jobs/restart"), &form)
                 .await,
         )
     }
@@ -213,12 +254,18 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn cancel_job(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::POST, &api(&format!("jobs/{job_id}/cancel")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::POST,
+                &api(&format!("jobs/{job_id}/cancel")),
+            )
+            .await,
         )
     }
 
@@ -232,13 +279,19 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn add_job_comment(
         &self,
-        Parameters(JobComment { job_id, text }): Parameters<JobComment>,
+        Parameters(JobComment {
+            server,
+            job_id,
+            text,
+        }): Parameters<JobComment>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("text", text);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::POST,
                 &api(&format!("jobs/{job_id}/comments")),
                 &form,
@@ -258,6 +311,7 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     async fn trigger_isos(
         &self,
         Parameters(TriggerIsos {
+            server,
             distri,
             version,
             flavor,
@@ -266,6 +320,7 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
         }): Parameters<TriggerIsos>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         bounded(
             "extra",
             extra.as_ref().map_or(0, HashMap::len),
@@ -286,7 +341,7 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
             }
         }
         to_result(
-            self.request_form(&ctx, Method::POST, &api("isos"), &form)
+            self.request_form(&ctx, client, Method::POST, &api("isos"), &form)
                 .await,
         )
     }
@@ -297,12 +352,18 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn delete_job(
         &self,
-        Parameters(JobId { job_id }): Parameters<JobId>,
+        Parameters(JobId { server, job_id }): Parameters<JobId>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
-            self.request_json(&ctx, Method::DELETE, &api(&format!("jobs/{job_id}")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::DELETE,
+                &api(&format!("jobs/{job_id}")),
+            )
+            .await,
         )
     }
 
@@ -313,18 +374,21 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     async fn duplicate_job(
         &self,
         Parameters(DuplicateJob {
+            server,
             job_id,
             prio,
             dup_type_auto,
         }): Parameters<DuplicateJob>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new()
             .push_opt("prio", prio)
             .push_opt("dup_type_auto", dup_type_auto);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::POST,
                 &api(&format!("jobs/{job_id}/duplicate")),
                 &form,
@@ -339,13 +403,19 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn set_job_priority(
         &self,
-        Parameters(SetJobPriority { job_id, prio }): Parameters<SetJobPriority>,
+        Parameters(SetJobPriority {
+            server,
+            job_id,
+            prio,
+        }): Parameters<SetJobPriority>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("prio", prio);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::POST,
                 &api(&format!("jobs/{job_id}/prio")),
                 &form,
@@ -363,6 +433,7 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
         Parameters(args): Parameters<CancelJobs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&args.server)?;
         let query = Query::new()
             .push("state", nonblank(args.state))
             .push("result", nonblank(args.result))
@@ -382,8 +453,13 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
             ));
         }
         to_result(
-            self.request_json(&ctx, Method::POST, &query.finish(&api("jobs/cancel")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::POST,
+                &query.finish(&api("jobs/cancel")),
+            )
+            .await,
         )
     }
 
@@ -397,13 +473,19 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn add_group_comment(
         &self,
-        Parameters(GroupComment { group_id, text }): Parameters<GroupComment>,
+        Parameters(GroupComment {
+            server,
+            group_id,
+            text,
+        }): Parameters<GroupComment>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("text", text);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::POST,
                 &api(&format!("groups/{group_id}/comments")),
                 &form,
@@ -423,15 +505,18 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     async fn add_parent_group_comment(
         &self,
         Parameters(ParentGroupComment {
+            server,
             parent_group_id,
             text,
         }): Parameters<ParentGroupComment>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("text", text);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::POST,
                 &api(&format!("parent_groups/{parent_group_id}/comments")),
                 &form,
@@ -447,16 +532,19 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     async fn update_job_comment(
         &self,
         Parameters(UpdateJobComment {
+            server,
             job_id,
             comment_id,
             text,
         }): Parameters<UpdateJobComment>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("text", text);
         to_result(
             self.request_form(
                 &ctx,
+                client,
                 Method::PUT,
                 &api(&format!("jobs/{job_id}/comments/{comment_id}")),
                 &form,
@@ -471,12 +559,18 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn delete_job_comment(
         &self,
-        Parameters(DeleteJobComment { job_id, comment_id }): Parameters<DeleteJobComment>,
+        Parameters(DeleteJobComment {
+            server,
+            job_id,
+            comment_id,
+        }): Parameters<DeleteJobComment>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         to_result(
             self.request_json(
                 &ctx,
+                client,
                 Method::DELETE,
                 &api(&format!("jobs/{job_id}/comments/{comment_id}")),
             )
@@ -490,12 +584,17 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn create_bug(
         &self,
-        Parameters(CreateBug { bugid, title }): Parameters<CreateBug>,
+        Parameters(CreateBug {
+            server,
+            bugid,
+            title,
+        }): Parameters<CreateBug>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let form = Form::new().push("bugid", bugid).push_opt("title", title);
         to_result(
-            self.request_form(&ctx, Method::POST, &api("bugs"), &form)
+            self.request_form(&ctx, client, Method::POST, &api("bugs"), &form)
                 .await,
         )
     }
@@ -506,13 +605,19 @@ openQA reports it in the response itself (a `result` map of restarted ids and an
     )]
     async fn cancel_scheduled_product(
         &self,
-        Parameters(CancelScheduledProduct { name }): Parameters<CancelScheduledProduct>,
+        Parameters(CancelScheduledProduct { server, name }): Parameters<CancelScheduledProduct>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
         let name = path_segment(&name)?;
         to_result(
-            self.request_json(&ctx, Method::POST, &api(&format!("isos/{name}/cancel")))
-                .await,
+            self.request_json(
+                &ctx,
+                client,
+                Method::POST,
+                &api(&format!("isos/{name}/cancel")),
+            )
+            .await,
         )
     }
 }
