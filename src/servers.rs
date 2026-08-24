@@ -72,6 +72,14 @@ impl ServerRegistry {
         self.clients.get(selector)
     }
 
+    /// Resolve `selector` to its canonical `host[:port]` id, for the audit
+    /// stream: `selector` is whatever alias the caller used (e.g. `osd`), the
+    /// audit record should carry the resolved host instead.
+    #[must_use]
+    pub fn resolve_id(&self, selector: &str) -> Option<String> {
+        self.resolve(selector).map(|c| canonical_id(c.base_url()))
+    }
+
     /// Sorted, for error messages and the `list_servers` tool.
     #[must_use]
     pub fn identifiers(&self) -> Vec<&str> {

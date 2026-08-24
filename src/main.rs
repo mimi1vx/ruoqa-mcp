@@ -14,6 +14,7 @@ use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
+use ruoqa_mcp::audit::{AuditConfig, Auditor, Transport};
 use ruoqa_mcp::http::{AuthConfigError, HttpAuth, HttpEnv, allowed_hosts, router};
 use ruoqa_mcp::servers::build_registry;
 use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer};
@@ -96,16 +97,49 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .then(|| HttpAuth::resolve(&http_env, cli.insecure_no_auth))
         .transpose()?;
 
+    // Config -> sink, before the registry and well before a socket is bound.
+    let audit = build_auditor(cli.audit_config.as_deref())?;
+    let transport = if cli.use_http() {
+        Transport::Http
+    } else {
+        Transport::Stdio
+    };
+
     let servers =
         build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;
     ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
     let call_timeout =
         ruoqa_mcp::config::call_timeout().context("invalid OPENQA_MCP_CALL_TIMEOUT")?;
-    let server = OpenQaServer::new(servers, readonly).with_call_timeout(call_timeout);
-    match auth {
+    let server = OpenQaServer::new(servers, readonly)
+        .with_call_timeout(call_timeout)
+        .with_audit(audit.clone())
+        .with_transport(transport);
+    let result = match auth {
         Some(auth) => run_http(server, auth, &cli).await,
         None => run_stdio(server).await,
+    };
+    if result.is_ok()
+        && let Some(audit) = &audit
+    {
+        audit.shutdown(audit.process_session(), transport);
     }
+    result
+}
+
+/// Parse `path` (if given) into an [`Auditor`], opening its sink. `None`
+/// disables auditing entirely: no config was requested at all.
+fn build_auditor(path: Option<&std::path::Path>) -> anyhow::Result<Option<Arc<Auditor>>> {
+    let Some(path) = path else { return Ok(None) };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read audit config {}", path.display()))?;
+    let cfg = AuditConfig::parse(&text)?;
+    let auditor = Auditor::open(&cfg).with_context(|| {
+        format!(
+            "failed to open the audit sink configured in {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(Arc::new(auditor)))
 }
 
 /// Cancel `ct` on Ctrl-C or, on Unix, SIGTERM; a background task so callers

@@ -1,5 +1,6 @@
 //! ruoqa-mcp library: module wiring shared between the binary and integration tests.
 
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod dotenv;

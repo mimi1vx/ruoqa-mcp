@@ -44,6 +44,9 @@ lzma-rs = "0.3"
 tar = { version = "0.4", default-features = false }
 regex = "1"
 url = "2"
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -51,6 +54,7 @@ tokio = { version = "1", features = ["test-util", "io-util"] }
 rmcp = { version = "3.1", features = [
     "client", "transport-streamable-http-client-reqwest",
 ] }
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "deny"   # ruoqa uses `forbid`; the `~/.env` loader and test modules need `env::set_var` (edition 2024)

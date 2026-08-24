@@ -1,18 +1,21 @@
 //! The `OpenQaServer` handler and the request funnel (port of `server.py`'s
 //! `mcp`, `_client`, and `_request`).
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::Method;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ResultType, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ResultType,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
+use crate::audit::{self, Auditor, Outcome, RecordScope, Transport};
 use crate::error::{classify, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
@@ -41,6 +44,12 @@ pub struct OpenQaServer {
     /// Whole-call deadline, independent of the per-HTTP-request timeout.
     /// `None` disables it.
     call_timeout: Option<Duration>,
+    /// The audit stream. `None` means auditing is off: no record is built, no
+    /// mutex is touched.
+    audit: Option<Arc<Auditor>>,
+    /// Which transport is serving this instance, carried onto every audit
+    /// record.
+    transport: Transport,
 }
 
 impl OpenQaServer {
@@ -59,6 +68,8 @@ impl OpenQaServer {
             tool_router,
             enforce_scopes: false,
             call_timeout: Some(DEFAULT_CALL_TIMEOUT),
+            audit: None,
+            transport: Transport::Stdio,
         }
     }
 
@@ -74,6 +85,21 @@ impl OpenQaServer {
     #[must_use]
     pub fn with_call_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.call_timeout = timeout;
+        self
+    }
+
+    /// Set the audit stream; `None` (the default) disables it entirely.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Option<Arc<Auditor>>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Set which transport is serving this instance, carried onto every
+    /// audit record.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -107,6 +133,18 @@ impl OpenQaServer {
         }
     }
 
+    /// A tool call's audit scope: `read`/`write` from the same
+    /// `read_only_hint` annotation [`is_read_only`] and [`authorize`] use, so
+    /// the audit stream can never disagree with what the gate actually
+    /// enforced.
+    fn record_scope(&self, name: &str) -> RecordScope {
+        if self.tool_router.get(name).is_some_and(is_read_only) {
+            RecordScope::Read
+        } else {
+            RecordScope::Write
+        }
+    }
+
     /// GET (or other body-less request) under a heartbeat.
     pub(crate) async fn request_json(
         &self,
@@ -131,6 +169,35 @@ impl OpenQaServer {
         let token = ctx.meta.get_progress_token();
         let pairs = form.pairs();
         with_heartbeat(&ctx.peer, token, client.request_form(method, path, &pairs)).await
+    }
+
+    /// The macro's body, gated on the caller's scope: `authorize` then
+    /// dispatch under the whole-call deadline.
+    async fn dispatch(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.authorize(&request.name, &context)?;
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let dispatch = self.tool_router.call(tcc);
+        match self.call_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, dispatch).await {
+                Ok(result) => result,
+                Err(_) => Ok(tool_error(
+                    "timeout",
+                    None,
+                    format!(
+                        "tool call exceeded the {}s deadline (OPENQA_MCP_CALL_TIMEOUT); an \
+                         in-flight write may already have been applied",
+                        timeout.as_secs_f64()
+                    ),
+                    None,
+                )?
+                .into()),
+            },
+            None => dispatch.await,
+        }
     }
 }
 
@@ -157,6 +224,69 @@ fn is_read_only(tool: &Tool) -> bool {
         .is_some_and(|a| a.read_only_hint == Some(true))
 }
 
+/// The session id an audit record should carry: the `Mcp-Session-Id` request
+/// header when present (HTTP, after the session that `initialize` created),
+/// else `process_session` (stdio, or the `initialize` request itself).
+fn session_of(context: &RequestContext<RoleServer>, process_session: &str) -> String {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get("mcp-session-id"))
+        .and_then(|value| value.to_str().ok())
+        .map_or_else(|| process_session.to_string(), str::to_string)
+}
+
+/// [`rmcp::service::negotiate_protocol_version`]'s body (`rmcp` 3.1.3 keeps it
+/// crate-private): echo the client's requested version if this server
+/// supports it, else fall back to the server's own default.
+fn negotiate_protocol_version(
+    client_requested: &ProtocolVersion,
+    server_fallback: ProtocolVersion,
+    server_supported: &[ProtocolVersion],
+) -> ProtocolVersion {
+    if server_supported.contains(client_requested) {
+        client_requested.clone()
+    } else {
+        server_fallback
+    }
+}
+
+/// Extract an [`Outcome`] from a tool call's result, per the classification
+/// table: a completed call with `is_error == Some(true)` reads back
+/// `error.rs::tool_error`'s own JSON shape (`kind`/`status`), an
+/// unparseable one (no such producer exists today) becomes `kind: "unknown"`
+/// rather than failing the call, and a protocol-level `Err` carries its
+/// JSON-RPC code.
+fn outcome_of(result: &Result<CallToolResponse, ErrorData>) -> Outcome {
+    match result {
+        Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => tool_error_outcome(r),
+        // `InputRequired`/`Task` (and anything `#[non_exhaustive]` adds
+        // later) are unreachable for this crate's tools, which use neither
+        // elicitation nor the tasks extension; treat them as success.
+        Ok(_) => Outcome::Ok,
+        Err(e) => Outcome::ProtocolError { code: e.code.0 },
+    }
+}
+
+fn tool_error_outcome(result: &CallToolResult) -> Outcome {
+    let text = result.content.first().and_then(|c| match c {
+        ContentBlock::Text(t) => Some(t.text.as_str()),
+        _ => None,
+    });
+    let payload = text.and_then(|t| serde_json::from_str::<Value>(t).ok());
+    let error = payload.as_ref().and_then(|v| v.get("error"));
+    let kind = error
+        .and_then(|e| e.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let status = error
+        .and_then(|e| e.get("status"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok());
+    Outcome::ToolError { kind, status }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OpenQaServer {
     fn get_info(&self) -> ServerInfo {
@@ -164,32 +294,71 @@ impl ServerHandler for OpenQaServer {
             .with_instructions(INSTRUCTIONS)
     }
 
-    /// The macro's body, gated on the caller's scope.
+    /// The default impl's body (`rmcp` 3.1.3), plus a `session_open` audit
+    /// record. Copied rather than delegated to `get_info()` alone, or
+    /// protocol-version negotiation silently regresses: there is no
+    /// `Mcp-Session-Id` yet at this point, so the record uses the
+    /// per-process session id even over HTTP.
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<InitializeResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
+    {
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        info.protocol_version = negotiate_protocol_version(
+            &request.protocol_version,
+            info.protocol_version,
+            &self.supported_protocol_versions(),
+        );
+        if let Some(audit) = &self.audit {
+            audit.session_open(audit.process_session(), self.transport);
+        }
+        std::future::ready(Ok(info))
+    }
+
+    /// The macro's body, gated on the caller's scope, wrapped in an audit
+    /// record when auditing is on. The audit wrapper encloses `dispatch`
+    /// (and therefore `authorize`): a refused write attempt is exactly what
+    /// the audit stream exists to record.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.authorize(&request.name, &context)?;
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let dispatch = self.tool_router.call(tcc);
-        match self.call_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, dispatch).await {
-                Ok(result) => result,
-                Err(_) => Ok(tool_error(
-                    "timeout",
-                    None,
-                    format!(
-                        "tool call exceeded the {}s deadline (OPENQA_MCP_CALL_TIMEOUT); an \
-                         in-flight write may already have been applied",
-                        timeout.as_secs_f64()
-                    ),
-                    None,
-                )?
-                .into()),
-            },
-            None => dispatch.await,
-        }
+        let Some(audit) = self.audit.clone() else {
+            return self.dispatch(request, context).await;
+        };
+        let start = Instant::now();
+        let tool = request.name.to_string();
+        let scope = self.record_scope(&tool);
+        let server_selector = request
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("server"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let args = audit::capture_args(request.arguments.as_ref());
+        let session = session_of(&context, audit.process_session());
+
+        let result = self.dispatch(request, context).await;
+
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let server = server_selector
+            .as_deref()
+            .and_then(|s| self.servers.resolve_id(s));
+        audit.tool_call(
+            session,
+            self.transport,
+            scope,
+            tool,
+            server,
+            args,
+            outcome_of(&result),
+            duration_ms,
+        );
+        result
     }
 
     /// The macro's body, minus the tools this principal could not call anyway.

@@ -2,6 +2,8 @@
 //! `argparse` logic in `__main__.py`'s `build_parser`/`main`). Split out of
 //! `main.rs` so integration tests can drive it without spawning the binary.
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
 /// Run the openQA MCP server over stdio (default) or HTTP.
@@ -51,6 +53,14 @@ pub struct Cli {
         value_delimiter = ','
     )]
     pub allowed_hosts: Vec<String>,
+
+    /// Path to the audit-stream TOML configuration. Auditing is off when unset.
+    #[arg(
+        long = "audit-config",
+        value_name = "PATH",
+        env = "OPENQA_MCP_AUDIT_CONFIG"
+    )]
+    pub audit_config: Option<PathBuf>,
 }
 
 /// Interpret an environment variable as a boolean toggle. Deliberately not
@@ -97,6 +107,7 @@ mod tests {
         assert!(!cli.use_http());
         assert!(!cli.insecure_no_auth);
         assert!(cli.allowed_hosts.is_empty());
+        assert!(cli.audit_config.is_none());
 
         let cli = Cli::parse_from([
             "ruoqa-mcp",
