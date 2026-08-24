@@ -330,12 +330,12 @@ For multiple servers, set `OPENQA_SERVER` to a comma-separated list (e.g.
 
 ### HTTP (optional)
 
-For remote or shared deployments, run over HTTP with `--http`. HTTP callers
-authenticate with a bearer token, so generate one first:
+For remote or shared deployments, run over HTTP with `--transport http`. HTTP
+callers authenticate with a bearer token, so generate one first:
 
 ```sh
 export OPENQA_MCP_HTTP_TOKEN=$(openssl rand -hex 32)
-ruoqa-mcp --http --server 127.0.0.1 --port 8000
+ruoqa-mcp --transport http --server 127.0.0.1 --port 8000
 ```
 
 The MCP endpoint is mounted at `/mcp`; clients send
@@ -370,13 +370,13 @@ printf 'OPENQA_MCP_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.env
 
 The server refuses to start (before binding the port) when:
 
-- `--http` is given with no token and no `--insecure-no-auth`;
+- `--transport http` is given with no token and no `--insecure-no-auth`;
 - `--insecure-no-auth` is combined with a token;
 - a token is shorter than 32 characters, or contains anything but printable
   non-space ASCII;
 - the read token equals the write token;
-- the `--allowed-host` flag is given without `--http` (the same value from the
-  environment or `~/.env` is simply ignored by a stdio run).
+- the `--allowed-host` flag is given without `--transport http` (the same
+  value from the environment or `~/.env` is simply ignored by a stdio run).
 
 Tokens set while running over stdio are ignored.
 
@@ -398,13 +398,14 @@ is not reached over loopback — the bind address is deliberately not treated as
 an identity, so binding `0.0.0.0` allows nothing extra:
 
 ```sh
-ruoqa-mcp --http --server 0.0.0.0 --allowed-host mcp.example.com:8000
+ruoqa-mcp --transport http --server 0.0.0.0 --allowed-host mcp.example.com:8000
 ```
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--http` | off | Serve over HTTP instead of stdio. |
-| `--stdio` | on | Serve over stdio; overrides `OPENQA_MCP_TRANSPORT=http`. |
+| `--transport` | `stdio` | Transport to serve on: `stdio` or `http`. |
+| `--http` | off | Deprecated alias for `--transport http`. |
+| `--stdio` | off | Deprecated alias for `--transport stdio`. |
 | `--server` | `127.0.0.1` | HTTP bind host. |
 | `--port` | `8000` | HTTP bind port. |
 | `--allowed-host` | *(none)* | Extra authority accepted in the `Host` header; repeatable. |
@@ -417,7 +418,7 @@ Flags override the environment, which supplies the defaults (and which
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPENQA_MCP_TRANSPORT` | `stdio` | Set to `http` to serve over HTTP. |
+| `OPENQA_MCP_TRANSPORT` | `stdio` | Default for `--transport` when it isn't given; set to `http` to serve over HTTP. An unrecognised value aborts startup. |
 | `OPENQA_MCP_HOST` | `127.0.0.1` | Default HTTP bind host. |
 | `OPENQA_MCP_PORT` | `8000` | Default HTTP bind port. |
 | `OPENQA_MCP_HTTP_TOKEN` | *(unset)* | Bearer token granting the write scope. |

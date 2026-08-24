@@ -77,8 +77,15 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let readonly = cli.readonly();
+    let transport = cli.transport().context("invalid OPENQA_MCP_TRANSPORT")?;
+    if cli.http || cli.stdio {
+        // Straight to stderr, not `tracing::warn!`: with RUST_LOG unset the
+        // subscriber only passes ERROR, and this banner must never be silent.
+        eprintln!("WARNING: --http/--stdio are deprecated; use --transport http|stdio");
+    }
+    let is_http = matches!(transport, Transport::Http);
     let http_env = HttpEnv::from_env();
-    if !cli.use_http() {
+    if !is_http {
         // Passing the flag to a stdio run is a mistake worth stopping for. The
         // same value arriving from the environment or `~/.env` is not: that is
         // daemon configuration, and an ad-hoc stdio run just ignores it, the
@@ -92,18 +99,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     // Resolve credentials before anything else: a misconfiguration must never
     // reach the point where a socket is bound.
-    let auth = cli
-        .use_http()
+    let auth = is_http
         .then(|| HttpAuth::resolve(&http_env, cli.insecure_no_auth))
         .transpose()?;
 
     // Config -> sink, before the registry and well before a socket is bound.
     let audit = build_auditor(cli.audit_config.as_deref())?;
-    let transport = if cli.use_http() {
-        Transport::Http
-    } else {
-        Transport::Stdio
-    };
 
     let servers =
         build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;

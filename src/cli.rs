@@ -2,9 +2,12 @@
 //! `argparse` logic in `__main__.py`'s `build_parser`/`main`). Split out of
 //! `main.rs` so integration tests can drive it without spawning the binary.
 
+use std::fmt;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+use crate::audit::Transport;
 
 /// Run the openQA MCP server over stdio (default) or HTTP.
 #[derive(Parser, Debug, Clone)]
@@ -14,11 +17,16 @@ use clap::Parser;
     reason = "a CLI is a flat bag of flags, not a state machine"
 )]
 pub struct Cli {
-    /// Serve over HTTP instead of stdio.
+    /// Transport to serve on. Defaults to the `OPENQA_MCP_TRANSPORT`
+    /// environment variable, else stdio.
+    #[arg(long, value_enum, conflicts_with_all = ["http", "stdio"])]
+    pub transport: Option<Transport>,
+
+    /// Deprecated: use `--transport http`.
     #[arg(long, conflicts_with = "stdio")]
     pub http: bool,
 
-    /// Serve over stdio (default; overrides `OPENQA_MCP_TRANSPORT=http`).
+    /// Deprecated: use `--transport stdio`.
     #[arg(long)]
     pub stdio: bool,
 
@@ -72,6 +80,25 @@ pub fn env_flag(name: &str) -> bool {
         .is_ok_and(|v| ["1", "true", "yes", "on"].contains(&v.trim().to_lowercase().as_str()))
 }
 
+/// `OPENQA_MCP_TRANSPORT` is set to a value that isn't `stdio` or `http`.
+#[derive(Debug)]
+pub struct InvalidTransport {
+    raw: String,
+}
+
+impl fmt::Display for InvalidTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "OPENQA_MCP_TRANSPORT is set to {:?}, which is not a valid transport \
+             (expected \"stdio\" or \"http\")",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for InvalidTransport {}
+
 impl Cli {
     /// Whether mutating tools should be disabled: the `--readonly` flag OR a
     /// truthy `OPENQA_READONLY`.
@@ -80,11 +107,30 @@ impl Cli {
         self.readonly || env_flag("OPENQA_READONLY")
     }
 
-    /// Whether to serve over HTTP. An explicit `--stdio` wins; otherwise
-    /// `--http` or `OPENQA_MCP_TRANSPORT=http` selects HTTP.
-    #[must_use]
-    pub fn use_http(&self) -> bool {
-        !self.stdio && (self.http || std::env::var("OPENQA_MCP_TRANSPORT").as_deref() == Ok("http"))
+    /// Resolve the transport to serve on. Precedence: `--transport` >
+    /// `--http`/`--stdio` > `OPENQA_MCP_TRANSPORT` > stdio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidTransport`] if `OPENQA_MCP_TRANSPORT` is set to
+    /// anything other than `stdio` or `http` (case-insensitive); an unset or
+    /// empty value falls through to the default instead of erroring.
+    pub fn transport(&self) -> Result<Transport, InvalidTransport> {
+        if let Some(transport) = self.transport {
+            return Ok(transport);
+        }
+        if self.stdio {
+            return Ok(Transport::Stdio);
+        }
+        if self.http {
+            return Ok(Transport::Http);
+        }
+        match std::env::var("OPENQA_MCP_TRANSPORT") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                Transport::from_str(&raw, true).map_err(|_| InvalidTransport { raw })
+            }
+            _ => Ok(Transport::Stdio),
+        }
     }
 }
 
@@ -97,14 +143,19 @@ mod tests {
     // and cargo runs tests in parallel threads within one binary, so every
     // case (env-dependent or not) lives in one #[test] fn to avoid a race.
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every env-touching case must stay in this one test fn, see comment above"
+    )]
     fn cli_parsing_and_env_precedence() {
         let cli = Cli::parse_from(["ruoqa-mcp"]);
         assert!(!cli.http);
         assert!(!cli.stdio);
+        assert!(cli.transport.is_none());
         assert_eq!(cli.host, "127.0.0.1");
         assert_eq!(cli.port, 8000);
         assert!(!cli.readonly());
-        assert!(!cli.use_http());
+        assert!(matches!(cli.transport().unwrap(), Transport::Stdio));
         assert!(!cli.insecure_no_auth);
         assert!(cli.allowed_hosts.is_empty());
         assert!(cli.audit_config.is_none());
@@ -130,11 +181,42 @@ mod tests {
         let err = Cli::try_parse_from(["ruoqa-mcp", "--http", "--stdio"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
 
+        let err = Cli::try_parse_from(["ruoqa-mcp", "--transport", "http", "--stdio"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let err = Cli::try_parse_from(["ruoqa-mcp", "--transport", "stdio", "--http"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
         let err = Cli::try_parse_from(["ruoqa-mcp", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
 
-        assert!(!Cli::parse_from(["ruoqa-mcp", "--stdio"]).use_http());
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--stdio"])
+                .transport()
+                .unwrap(),
+            Transport::Stdio
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--http"])
+                .transport()
+                .unwrap(),
+            Transport::Http
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--transport", "http"])
+                .transport()
+                .unwrap(),
+            Transport::Http
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--transport", "stdio"])
+                .transport()
+                .unwrap(),
+            Transport::Stdio
+        ));
+        // clap's ValueEnum matching is case-sensitive by default.
+        let err = Cli::try_parse_from(["ruoqa-mcp", "--transport", "HTTP"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
         assert!(Cli::parse_from(["ruoqa-mcp", "--readonly"]).readonly());
 
         // SAFETY: no other test in this binary mutates these variables.
@@ -182,9 +264,40 @@ mod tests {
         unsafe { std::env::remove_var("OPENQA_MCP_ALLOWED_HOSTS") };
 
         unsafe { std::env::set_var("OPENQA_MCP_TRANSPORT", "http") };
-        assert!(Cli::parse_from(["ruoqa-mcp"]).use_http());
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp"]).transport().unwrap(),
+            Transport::Http
+        ));
         // --stdio beats OPENQA_MCP_TRANSPORT=http.
-        assert!(!Cli::parse_from(["ruoqa-mcp", "--stdio"]).use_http());
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--stdio"])
+                .transport()
+                .unwrap(),
+            Transport::Stdio
+        ));
+        // --transport stdio beats OPENQA_MCP_TRANSPORT=http.
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--transport", "stdio"])
+                .transport()
+                .unwrap(),
+            Transport::Stdio
+        ));
+        unsafe { std::env::remove_var("OPENQA_MCP_TRANSPORT") };
+        // --transport http with the var unset still resolves to Http.
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp", "--transport", "http"])
+                .transport()
+                .unwrap(),
+            Transport::Http
+        ));
+
+        unsafe { std::env::set_var("OPENQA_MCP_TRANSPORT", "") };
+        assert!(matches!(
+            Cli::parse_from(["ruoqa-mcp"]).transport().unwrap(),
+            Transport::Stdio
+        ));
+        unsafe { std::env::set_var("OPENQA_MCP_TRANSPORT", "tcp") };
+        assert!(Cli::parse_from(["ruoqa-mcp"]).transport().is_err());
         unsafe { std::env::remove_var("OPENQA_MCP_TRANSPORT") };
     }
 }

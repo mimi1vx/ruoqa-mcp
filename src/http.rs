@@ -94,8 +94,9 @@ impl fmt::Display for AuthConfigError {
         match self {
             Self::NoToken => write!(
                 f,
-                "--http requires a bearer token: set OPENQA_MCP_HTTP_TOKEN in the environment \
-                 or in ~/.env, or pass --insecure-no-auth to serve without authentication"
+                "--transport http requires a bearer token: set OPENQA_MCP_HTTP_TOKEN in the \
+                 environment or in ~/.env, or pass --insecure-no-auth to serve without \
+                 authentication"
             ),
             Self::InsecureWithToken => write!(
                 f,
@@ -113,7 +114,7 @@ impl fmt::Display for AuthConfigError {
                 f,
                 "the read token and the write token are identical; scopes would be meaningless"
             ),
-            Self::AllowedHostsWithoutHttp => write!(f, "--allowed-host requires --http"),
+            Self::AllowedHostsWithoutHttp => write!(f, "--allowed-host requires --transport http"),
         }
     }
 }

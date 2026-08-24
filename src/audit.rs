@@ -17,8 +17,10 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-/// Which transport served a session; carried on every record.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// Which transport served a session; carried on every record. Also the CLI's
+/// `--transport` value type — the two vocabularies must agree, since a
+/// mismatch would change flag values and audit records together.
+#[derive(Debug, Clone, Copy, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Stdio,
