@@ -38,27 +38,32 @@ impl ServerHandler for Spy {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + rmcp::service::MaybeSendFuture
+    {
+        std::future::ready(Ok(ListToolsResult {
             tools: vec![Tool::new("spy", "reports the marker", Arc::default())],
             ..Default::default()
-        })
+        }))
     }
 
-    async fn call_tool(
+    fn call_tool(
         &self,
         _request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + rmcp::service::MaybeSendFuture
+    {
         let seen = context
             .extensions
             .get::<Parts>()
             .is_some_and(|parts| parts.extensions.get::<Marker>().is_some());
-        Ok(CallToolResult::success(vec![ContentBlock::text(seen.to_string())]).into())
+        std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
+            seen.to_string(),
+        )])
+        .into()))
     }
 }
 
@@ -145,6 +150,10 @@ fn tokens() -> HttpEnv {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "test helper returning ServiceExt::serve's own Result as-is"
+)]
 async fn connect(
     addr: std::net::SocketAddr,
     token: Option<&str>,
