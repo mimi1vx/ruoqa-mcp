@@ -146,6 +146,10 @@ impl OpenQaServer {
     }
 
     /// GET (or other body-less request) under a heartbeat.
+    #[allow(
+        clippy::result_large_err,
+        reason = "ruoqa::Client::request returns ruoqa::Result<Value> as-is; every tool matches on it via to_result/classify"
+    )]
     pub(crate) async fn request_json(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -158,6 +162,10 @@ impl OpenQaServer {
     }
 
     /// Form-encoded write under a heartbeat.
+    #[allow(
+        clippy::result_large_err,
+        reason = "ruoqa::Client::request_form returns ruoqa::Result<Value> as-is; every tool matches on it via to_result/classify"
+    )]
     pub(crate) async fn request_form(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -362,23 +370,24 @@ impl ServerHandler for OpenQaServer {
     }
 
     /// The macro's body, minus the tools this principal could not call anyway.
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
+    {
         let mut tools = self.tool_router.list_all();
         if self.enforce_scopes {
             match scope_of(&context) {
                 Some(Scope::Write) => {}
                 Some(Scope::Read) => tools.retain(is_read_only),
-                None => return Err(ErrorData::invalid_request(DENIED, None)),
+                None => return std::future::ready(Err(ErrorData::invalid_request(DENIED, None))),
             }
         }
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        Ok(ListToolsResult {
+        std::future::ready(Ok(ListToolsResult {
             result_type: Some(ResultType::COMPLETE),
             tools,
             meta: None,
@@ -387,7 +396,7 @@ impl ServerHandler for OpenQaServer {
             // Tool visibility depends on the caller's scope, so a shared cache
             // would hand a read principal the write list.
             cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
-        })
+        }))
     }
 }
 
