@@ -8,6 +8,7 @@ pub(crate) mod error;
 pub mod form;
 pub mod heartbeat;
 pub mod http;
+pub(crate) mod otel;
 pub mod query;
 pub mod server;
 pub mod servers;
