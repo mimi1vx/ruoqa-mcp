@@ -56,4 +56,39 @@ impl Telemetry {
     pub async fn shutdown(self) {
         self.0.shutdown().await;
     }
+
+    /// A send handle onto the logs pipeline, for [`audit::Auditor::with_otlp`]
+    /// to piggyback the audit stream on. `None` when the logs signal is not
+    /// configured.
+    #[must_use]
+    pub fn log_producer(&self) -> Option<LogProducer> {
+        self.0.log_producer().map(LogProducer)
+    }
+
+    /// The diagnostics `tracing` `Layer`: one `LogRecord` per non-excluded
+    /// event, filtered by `RUST_LOG` (default INFO) and the pipeline's own
+    /// target exclusion. `None` when the logs signal is not configured —
+    /// `Option<Layer>` is itself a `Layer`, so composing it into a
+    /// `tracing_subscriber::registry()` needs no `cfg` and no boxing.
+    #[must_use]
+    pub fn diagnostics_layer<S>(
+        &self,
+    ) -> Option<impl tracing_subscriber::Layer<S> + Send + Sync + 'static>
+    where
+        S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    {
+        self.0.diagnostics_layer()
+    }
+}
+
+/// Opaque send handle onto the logs export pipeline, for the audit stream to
+/// piggyback on. No `Debug`: the records it carries may include tool
+/// arguments.
+#[derive(Clone)]
+pub struct LogProducer(otel::pipeline::Producer);
+
+impl LogProducer {
+    pub(crate) fn enqueue(&self, encoded_record: Vec<u8>) {
+        self.0.enqueue(encoded_record);
+    }
 }

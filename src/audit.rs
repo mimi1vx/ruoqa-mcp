@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
+use crate::LogProducer;
+use crate::otel::{logs, proto};
+
 /// Which transport served a session; carried on every record. Also the CLI's
 /// `--transport` value type — the two vocabularies must agree, since a
 /// mismatch would change flag values and audit records together.
@@ -25,6 +28,15 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 pub enum Transport {
     Stdio,
     Http,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Stdio => "stdio",
+            Transport::Http => "http",
+        }
+    }
 }
 
 /// A tool's mutating classification, or `none` for a session-level event.
@@ -46,6 +58,17 @@ pub enum Event {
     /// pinned here but nothing in this phase emits it.
     AuditGap,
     Shutdown,
+}
+
+impl Event {
+    fn as_str(self) -> &'static str {
+        match self {
+            Event::SessionOpen => "session_open",
+            Event::ToolCall => "tool_call",
+            Event::AuditGap => "audit_gap",
+            Event::Shutdown => "shutdown",
+        }
+    }
 }
 
 /// A tool call's result, reusing `error.rs`'s `kind` vocabulary so an audit
@@ -420,10 +443,14 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// The audit stream's write side: session id, sequence numbering, and the
-/// (optional) file sink.
+/// The audit stream's write side: session id, sequence numbering, the
+/// (optional) file sink, and the (optional) OTLP bridge.
 pub struct Auditor {
-    sink: Option<Mutex<Sink>>,
+    /// Always a real `Mutex`, even with no file sink: the lock is what makes
+    /// `seq` order equal emission order, and the OTLP export must inherit
+    /// that guarantee too, not just the file.
+    sink: Mutex<Option<Sink>>,
+    otlp: Option<LogProducer>,
     seq: AtomicU64,
     process_session: String,
 }
@@ -437,10 +464,20 @@ impl Auditor {
     /// not be created, or if the path is a symlink.
     pub fn open(cfg: &AuditConfig) -> io::Result<Self> {
         Ok(Self {
-            sink: Sink::open(cfg)?.map(Mutex::new),
+            sink: Mutex::new(Sink::open(cfg)?),
+            otlp: None,
             seq: AtomicU64::new(1),
             process_session: process_session_id(),
         })
+    }
+
+    /// Bridge every record onto the OTLP logs pipeline too, tagged
+    /// `ruoqa.stream = "audit"`. `path = "none"` plus this is what makes a
+    /// collector the *only* audit sink.
+    #[must_use]
+    pub fn with_otlp(mut self, producer: LogProducer) -> Self {
+        self.otlp = Some(producer);
+        self
     }
 
     /// The per-process session id used over stdio and at `initialize`.
@@ -449,18 +486,28 @@ impl Auditor {
         &self.process_session
     }
 
-    /// Assign `seq`/`ts` and append, while holding the sink's lock, so file
-    /// order always equals sequence order. A no-op when there is no sink.
+    /// Assign `seq`/`ts`, serialise, and append/export, all under the same
+    /// lock so file order and OTLP emission order both equal sequence order.
+    /// A no-op — no lock contention, no seq spent — only when neither a file
+    /// sink nor an OTLP producer is configured.
     fn write(&self, mut record: Record) {
-        let Some(sink) = &self.sink else { return };
-        let mut guard = sink
+        let mut guard = self
+            .sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() && self.otlp.is_none() {
+            return;
+        }
         record.seq = self.seq.fetch_add(1, Ordering::SeqCst);
         record.ts = now_rfc3339();
         let line = serde_json::to_string(&record).expect("Record serialization cannot fail");
-        if let Err(e) = guard.append(&line) {
-            tracing::warn!(error = %e, path = %guard.path.display(), "audit sink append failed");
+        if let Some(sink) = guard.as_mut()
+            && let Err(e) = sink.append(&line)
+        {
+            tracing::warn!(error = %e, path = %sink.path.display(), "audit sink append failed");
+        }
+        if let Some(otlp) = &self.otlp {
+            otlp.enqueue(encode_otlp_record(&record, &line));
         }
     }
 
@@ -508,6 +555,78 @@ impl Auditor {
         record.duration_ms = Some(duration_ms);
         self.write(record);
     }
+}
+
+/// A record's OTLP attribute values. Owned, unlike `otel::proto::Value`,
+/// because the flattened `outcome`/`error.kind` strings (`"rpc_<code>"`) do
+/// not borrow from anything that outlives this function.
+#[derive(Debug, PartialEq)]
+enum AuditAttr {
+    Str(String),
+    Int(i64),
+}
+
+impl AuditAttr {
+    fn as_proto(&self) -> proto::Value<'_> {
+        match self {
+            AuditAttr::Str(s) => proto::Value::Str(s),
+            AuditAttr::Int(i) => proto::Value::Int(*i),
+        }
+    }
+}
+
+/// Computes one [`Record`]'s OTLP severity and attributes, independent of
+/// encoding: `outcome` is flattened for querying (the serialised form is a
+/// tagged object; an attribute must be a scalar), reusing `error.rs`'s `kind`
+/// vocabulary so an audit record, a tool response and a metric attribute
+/// never describe the same failure three ways.
+fn otlp_attributes(record: &Record) -> (logs::Severity, Vec<(&'static str, AuditAttr)>) {
+    let severity = if matches!(record.event, Event::AuditGap) {
+        logs::Severity::Error
+    } else {
+        logs::Severity::Info
+    };
+    let mut attrs = vec![
+        ("ruoqa.stream", AuditAttr::Str("audit".to_string())),
+        ("event", AuditAttr::Str(record.event.as_str().to_string())),
+        (
+            "seq",
+            AuditAttr::Int(i64::try_from(record.seq).unwrap_or(i64::MAX)),
+        ),
+        (
+            "transport",
+            AuditAttr::Str(record.transport.as_str().to_string()),
+        ),
+    ];
+    if let Some(tool) = &record.tool {
+        attrs.push(("tool", AuditAttr::Str(tool.clone())));
+    }
+    if let Some(server) = &record.server {
+        attrs.push(("server", AuditAttr::Str(server.clone())));
+    }
+    match &record.outcome {
+        Some(Outcome::Ok) => attrs.push(("outcome", AuditAttr::Str("ok".to_string()))),
+        Some(Outcome::ToolError { kind, .. }) => {
+            attrs.push(("outcome", AuditAttr::Str("tool_error".to_string())));
+            attrs.push(("error.kind", AuditAttr::Str(kind.clone())));
+        }
+        Some(Outcome::ProtocolError { code }) => {
+            attrs.push(("outcome", AuditAttr::Str("protocol_error".to_string())));
+            attrs.push(("error.kind", AuditAttr::Str(format!("rpc_{code}"))));
+        }
+        None => {}
+    }
+    (severity, attrs)
+}
+
+/// Encodes one audit `Record` as a `LogRecord`. `body` is `line` verbatim —
+/// the same JSONL string just appended to the file, minus the trailing
+/// `'\n'` — so the exported body and the file line are byte-equal.
+fn encode_otlp_record(record: &Record, line: &str) -> Vec<u8> {
+    let (severity, attrs) = otlp_attributes(record);
+    let attr_refs: Vec<(&str, proto::Value<'_>)> =
+        attrs.iter().map(|(k, v)| (*k, v.as_proto())).collect();
+    logs::encode_record(logs::now_unix_nanos(), severity, line, &attr_refs)
 }
 
 #[cfg(test)]
@@ -845,5 +964,119 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(!numbered(&path, 1).exists());
+    }
+
+    fn stub_producer() -> (LogProducer, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (
+            LogProducer(crate::otel::pipeline::Producer::for_test(tx)),
+            rx,
+        )
+    }
+
+    #[test]
+    fn path_none_with_otlp_still_numbers_seq_and_creates_no_file() {
+        let cfg = AuditConfig::parse("path = \"none\"\n").unwrap();
+        let (producer, mut rx) = stub_producer();
+        let auditor = Auditor::open(&cfg).unwrap().with_otlp(producer);
+
+        for i in 0..3 {
+            auditor.session_open(format!("s{i}"), Transport::Stdio);
+        }
+
+        // The defect this restructure fixes: without it, `seq` never
+        // advances when there is no file sink, so every exported record
+        // would carry `seq: 0`.
+        assert_eq!(auditor.seq.load(Ordering::SeqCst), 4);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "exactly 3 records enqueued");
+    }
+
+    #[test]
+    fn otlp_and_file_both_receive_every_record_when_both_are_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let cfg = AuditConfig::parse(&format!("path = {:?}\n", path.to_str().unwrap())).unwrap();
+        let (producer, mut rx) = stub_producer();
+        let auditor = Auditor::open(&cfg).unwrap().with_otlp(producer);
+
+        auditor.session_open("s0", Transport::Stdio);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn otlp_attributes_ok_outcome() {
+        let mut record = Record::event(
+            "s".to_string(),
+            Transport::Http,
+            RecordScope::Write,
+            Event::ToolCall,
+        );
+        record.seq = 7;
+        record.tool = Some("add_job_comment".to_string());
+        record.server = Some("osd".to_string());
+        record.outcome = Some(Outcome::Ok);
+        let (severity, attrs) = otlp_attributes(&record);
+        assert_eq!(severity, logs::Severity::Info);
+        assert_eq!(
+            attrs,
+            vec![
+                ("ruoqa.stream", AuditAttr::Str("audit".to_string())),
+                ("event", AuditAttr::Str("tool_call".to_string())),
+                ("seq", AuditAttr::Int(7)),
+                ("transport", AuditAttr::Str("http".to_string())),
+                ("tool", AuditAttr::Str("add_job_comment".to_string())),
+                ("server", AuditAttr::Str("osd".to_string())),
+                ("outcome", AuditAttr::Str("ok".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn otlp_attributes_tool_error_outcome_carries_error_kind() {
+        let mut record = Record::event(
+            "s".to_string(),
+            Transport::Http,
+            RecordScope::Read,
+            Event::ToolCall,
+        );
+        record.outcome = Some(Outcome::ToolError {
+            kind: "not_found".to_string(),
+            status: Some(404),
+        });
+        let (_, attrs) = otlp_attributes(&record);
+        assert!(attrs.contains(&("outcome", AuditAttr::Str("tool_error".to_string()))));
+        assert!(attrs.contains(&("error.kind", AuditAttr::Str("not_found".to_string()))));
+    }
+
+    #[test]
+    fn otlp_attributes_protocol_error_outcome_carries_rpc_error_kind() {
+        let mut record = Record::event(
+            "s".to_string(),
+            Transport::Stdio,
+            RecordScope::Write,
+            Event::ToolCall,
+        );
+        record.outcome = Some(Outcome::ProtocolError { code: -32602 });
+        let (_, attrs) = otlp_attributes(&record);
+        assert!(attrs.contains(&("outcome", AuditAttr::Str("protocol_error".to_string()))));
+        assert!(attrs.contains(&("error.kind", AuditAttr::Str("rpc_-32602".to_string()))));
+    }
+
+    #[test]
+    fn otlp_attributes_audit_gap_is_error_severity() {
+        let record = Record::event(
+            "s".to_string(),
+            Transport::Stdio,
+            RecordScope::None,
+            Event::AuditGap,
+        );
+        let (severity, _) = otlp_attributes(&record);
+        assert_eq!(severity, logs::Severity::Error);
     }
 }

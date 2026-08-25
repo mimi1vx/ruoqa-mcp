@@ -7,7 +7,7 @@ pub(crate) mod pipeline;
 pub(crate) mod proto;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -66,6 +66,51 @@ impl Telemetry {
             logs.shutdown(SHUTDOWN_BUDGET).await;
         }
     }
+
+    /// A send handle onto the logs pipeline, for the audit stream to
+    /// piggyback on. `None` when the logs signal is not configured.
+    pub(crate) fn log_producer(&self) -> Option<pipeline::Producer> {
+        self.logs.as_ref().map(pipeline::Exporter::producer)
+    }
+
+    /// The diagnostics `tracing` `Layer`, filtered so `RUST_LOG` (defaulting
+    /// to INFO, unlike the stderr layer's ERROR default) and the pipeline's
+    /// own target exclusion both gate it. `None` when the logs signal is not
+    /// configured: `Option<Layer>` is itself a `Layer`, so "off means off"
+    /// costs the caller no `cfg` and no boxing.
+    pub(crate) fn diagnostics_layer<S>(
+        &self,
+    ) -> Option<impl tracing_subscriber::Layer<S> + Send + Sync + 'static>
+    where
+        S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    {
+        use tracing_subscriber::layer::Layer;
+
+        self.logs.as_ref().map(|exporter| {
+            let layer = logs::DiagnosticsLayer::new(exporter.producer());
+            // Two independent predicates, both required: the target
+            // exclusion (retiring `excluded`'s only remaining purpose) and a
+            // `RUST_LOG`-driven level filter whose *default* deliberately
+            // differs from the stderr layer's ERROR-only default. Documented
+            // here and in the README: a collector configured with no
+            // `--audit-config` sees lifecycle events, warnings and errors
+            // only at the default `RUST_LOG`.
+            let target_filter =
+                tracing_subscriber::filter::filter_fn(|meta: &tracing::Metadata<'_>| {
+                    !pipeline::excluded(meta.target())
+                });
+            let level_filter = tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy();
+            // Explicit turbofish on `S`: `DiagnosticsLayer` and `FilterFn`
+            // both implement `Layer<S>`/`Filter<S>` generically over every
+            // `S`, so plain method-call syntax leaves `S` unresolved inside
+            // this closure — the eventual `impl Layer<S>` return type is not
+            // fed back into the closure body during inference.
+            let with_level = Layer::<S>::with_filter(layer, level_filter);
+            Layer::<S>::with_filter(with_level, target_filter)
+        })
+    }
 }
 
 fn resource_attrs(service_name: &str) -> Vec<(String, String)> {
@@ -123,11 +168,8 @@ async fn probe(
     service_name: &str,
     signal: &SignalConfig,
 ) -> anyhow::Result<()> {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let record = logs::encode_record(
-        now_nanos,
+        logs::now_unix_nanos(),
         logs::Severity::Info,
         "ruoqa-mcp startup probe",
         &[

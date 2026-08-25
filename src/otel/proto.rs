@@ -25,10 +25,6 @@ fn write_tag(buf: &mut Vec<u8>, field: u32, wire: u32) {
     write_varint(buf, u64::from((field << 3) | wire));
 }
 
-#[allow(
-    dead_code,
-    reason = "AnyValue::Bool has no caller before phase F (metrics)"
-)]
 fn write_bool(buf: &mut Vec<u8>, field: u32, v: bool) {
     if v {
         write_tag(buf, field, WIRE_VARINT);
@@ -46,10 +42,6 @@ pub(super) fn write_uint32(buf: &mut Vec<u8>, field: u32, v: u32) {
 /// `int64` is plain varint, not zigzag — `sint64` is the zigzag variant and
 /// OTLP does not use it. A negative value two's-complement-reinterprets as
 /// `u64`, producing the correct ten-byte varint.
-#[allow(
-    dead_code,
-    reason = "no integer attribute is emitted before phase D's seq-style attrs"
-)]
 fn write_int64(buf: &mut Vec<u8>, field: u32, v: i64) {
     if v != 0 {
         write_tag(buf, field, WIRE_VARINT);
@@ -72,10 +64,6 @@ pub(super) fn write_fixed64(buf: &mut Vec<u8>, field: u32, v: u64) {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Histogram/gauge data points have no caller before phase F"
-)]
 fn write_double(buf: &mut Vec<u8>, field: u32, v: f64) {
     if v != 0.0 {
         write_tag(buf, field, WIRE_FIXED64);
@@ -148,20 +136,8 @@ pub(super) fn write_message(buf: &mut Vec<u8>, field: u32, body: impl FnOnce(&mu
 /// deliberately absent: every attribute we produce is a scalar.
 pub(crate) enum Value<'a> {
     Str(&'a str),
-    #[allow(
-        dead_code,
-        reason = "no integer attribute is emitted before phase D's seq-style attrs"
-    )]
     Int(i64),
-    #[allow(
-        dead_code,
-        reason = "no bool attribute has a caller before phase F (metrics)"
-    )]
     Bool(bool),
-    #[allow(
-        dead_code,
-        reason = "no double attribute has a caller before phase F (metrics)"
-    )]
     Double(f64),
 }
 
