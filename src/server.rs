@@ -58,11 +58,21 @@ impl OpenQaServer {
     /// hand-maintained list of mutating tool names to disable at runtime.
     #[must_use]
     pub fn new(servers: ServerRegistry, readonly: bool) -> Self {
-        let tool_router = if readonly {
+        let mut tool_router = if readonly {
             Self::read_tool_router()
         } else {
             Self::read_tool_router() + Self::write_tool_router()
         };
+        // Vertex's FunctionDeclaration validator rejects an `anyOf` with
+        // sibling keys, which is what a Gemini client turns schemars'
+        // `Option<T>` rendering (`"type": [T, "null"]`) into.
+        for route in tool_router.map.values_mut() {
+            let attr = Arc::make_mut(&mut route.attr.input_schema);
+            crate::schema::degrade_nullable_unions(attr);
+            if let Some(output_schema) = &mut route.attr.output_schema {
+                crate::schema::degrade_nullable_unions(Arc::make_mut(output_schema));
+            }
+        }
         Self {
             servers,
             tool_router,
@@ -434,6 +444,43 @@ mod tests {
         assert!(message.contains("nope"), "{message}");
         assert!(message.contains("one"), "{message}");
         assert!(message.contains("two"), "{message}");
+    }
+
+    // Vertex rejects an `anyOf` with sibling keys, which is what a Gemini
+    // client turns schemars' `Option<T>` union into; every tool schema must
+    // come out already collapsed to a bare scalar type.
+    #[test]
+    fn tool_schemas_have_no_nullable_unions() {
+        fn assert_no_union(node: &Value, path: &str) {
+            match node {
+                Value::Object(map) => {
+                    if let Some(Value::Array(_)) = map.get("type") {
+                        panic!("{path}: array \"type\" was not collapsed: {node}");
+                    }
+                    assert!(
+                        map.get("default") != Some(&Value::Null),
+                        "{path}: leftover \"default\": null at {node}"
+                    );
+                    for (key, value) in map {
+                        assert_no_union(value, &format!("{path}.{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        assert_no_union(item, &format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let server = OpenQaServer::new(fixture_registry(), false);
+        for tool in server.tool_router.list_all() {
+            assert_no_union(&Value::Object((*tool.input_schema).clone()), &tool.name);
+            if let Some(output_schema) = &tool.output_schema {
+                assert_no_union(&Value::Object((**output_schema).clone()), &tool.name);
+            }
+        }
     }
 }
 

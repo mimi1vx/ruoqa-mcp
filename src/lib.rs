@@ -10,6 +10,7 @@ pub mod heartbeat;
 pub mod http;
 pub(crate) mod otel;
 pub mod query;
+pub(crate) mod schema;
 pub mod server;
 pub mod servers;
 pub mod summary;
