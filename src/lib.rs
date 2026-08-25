@@ -65,6 +65,16 @@ impl Telemetry {
         self.0.log_producer().map(LogProducer)
     }
 
+    /// A send handle onto the traces pipeline plus the resolved
+    /// `OTEL_TRACES_SAMPLER`, for [`server::OpenQaServer::with_traces`].
+    /// `None` when the traces signal is not configured.
+    #[must_use]
+    pub fn trace_producer(&self) -> Option<TraceProducer> {
+        self.0
+            .trace_producer()
+            .map(|(producer, sampler)| TraceProducer { producer, sampler })
+    }
+
     /// The diagnostics `tracing` `Layer`: one `LogRecord` per non-excluded
     /// event, filtered by `RUST_LOG` (default INFO) and the pipeline's own
     /// target exclusion. `None` when the logs signal is not configured —
@@ -90,5 +100,24 @@ pub struct LogProducer(otel::pipeline::Producer);
 impl LogProducer {
     pub(crate) fn enqueue(&self, encoded_record: Vec<u8>) {
         self.0.enqueue(encoded_record);
+    }
+}
+
+/// Opaque send handle onto the traces export pipeline, carrying the
+/// resolved `OTEL_TRACES_SAMPLER` alongside it — the one place a tool call
+/// needs it, so `server.rs` need not otherwise reach into `otel::env`.
+#[derive(Clone)]
+pub struct TraceProducer {
+    producer: otel::pipeline::Producer,
+    sampler: otel::env::Sampler,
+}
+
+impl TraceProducer {
+    pub(crate) fn enqueue(&self, encoded_span: Vec<u8>) {
+        self.producer.enqueue(encoded_span);
+    }
+
+    pub(crate) fn sampler(&self) -> otel::env::Sampler {
+        self.sampler
     }
 }

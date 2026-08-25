@@ -127,6 +127,7 @@ async fn run(cli: Cli, telemetry: Option<Telemetry>) -> anyhow::Result<()> {
     // function even started), so the sink can bridge onto the OTLP pipeline
     // from the moment it opens.
     let log_producer = telemetry.as_ref().and_then(Telemetry::log_producer);
+    let trace_producer = telemetry.as_ref().and_then(Telemetry::trace_producer);
     let audit = build_auditor(cli.audit_config.as_deref(), log_producer)?;
 
     let servers =
@@ -138,7 +139,8 @@ async fn run(cli: Cli, telemetry: Option<Telemetry>) -> anyhow::Result<()> {
     let server = OpenQaServer::new(servers, readonly)
         .with_call_timeout(call_timeout)
         .with_audit(audit.clone())
-        .with_transport(transport);
+        .with_transport(transport)
+        .with_traces(trace_producer);
     // One event, not five: everything an operator with a default `RUST_LOG`
     // needs to confirm the process came up the way they configured it.
     tracing::info!(

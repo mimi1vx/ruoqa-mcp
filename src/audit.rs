@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use crate::LogProducer;
-use crate::otel::{logs, proto};
+use crate::otel::{logs, proto, traces};
 
 /// Which transport served a session; carried on every record. Also the CLI's
 /// `--transport` value type — the two vocabularies must agree, since a
@@ -109,6 +109,12 @@ pub struct Record {
     outcome: Option<Outcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+    /// Lowercase hex, from the tool call's exported span (E4, additive to
+    /// `v = 1`). `None` when traces are off or the call was not sampled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<String>,
 }
 
 impl Record {
@@ -129,6 +135,8 @@ impl Record {
             args: None,
             outcome: None,
             duration_ms: None,
+            trace: None,
+            span: None,
         }
     }
 }
@@ -529,6 +537,10 @@ impl Auditor {
         ));
     }
 
+    /// `trace` is `Some((trace_hex, span_hex))` when this call's tool span
+    /// was sampled — the same [`otel::traces::SpanCtx`](traces::SpanCtx) the
+    /// exported span used, not a re-derived one, so the two can never
+    /// disagree.
     #[allow(clippy::too_many_arguments)]
     pub fn tool_call(
         &self,
@@ -540,6 +552,7 @@ impl Auditor {
         args: Option<Value>,
         outcome: Outcome,
         duration_ms: u64,
+        trace: Option<(String, String)>,
     ) {
         let mut record = Record::event(
             session.into(),
@@ -553,6 +566,10 @@ impl Auditor {
         record.args = args;
         record.outcome = Some(outcome);
         record.duration_ms = Some(duration_ms);
+        if let Some((trace, span)) = trace {
+            record.trace = Some(trace);
+            record.span = Some(span);
+        }
         self.write(record);
     }
 }
@@ -626,7 +643,23 @@ fn encode_otlp_record(record: &Record, line: &str) -> Vec<u8> {
     let (severity, attrs) = otlp_attributes(record);
     let attr_refs: Vec<(&str, proto::Value<'_>)> =
         attrs.iter().map(|(k, v)| (*k, v.as_proto())).collect();
-    logs::encode_record(logs::now_unix_nanos(), severity, line, &attr_refs)
+    logs::encode_record(
+        logs::now_unix_nanos(),
+        severity,
+        line,
+        &attr_refs,
+        record_span_ctx(record),
+    )
+}
+
+/// Reconstructs a [`traces::SpanCtx`] from a `Record`'s already-hex-encoded
+/// `trace`/`span` fields, so `LogRecord.trace_id`/`span_id` (E6) match the
+/// JSONL line's own `trace`/`span` keys byte for byte — no re-derivation, no
+/// task-local read, just the same ids parsed back out.
+fn record_span_ctx(record: &Record) -> Option<traces::SpanCtx> {
+    let trace_id = traces::decode_hex::<16>(record.trace.as_deref()?)?;
+    let span_id = traces::decode_hex::<8>(record.span.as_deref()?)?;
+    Some(traces::SpanCtx::from_raw(trace_id, span_id, true))
 }
 
 #[cfg(test)]
@@ -898,6 +931,7 @@ mod tests {
                             None,
                             Outcome::Ok,
                             0,
+                            None,
                         );
                     }
                 });
@@ -959,6 +993,7 @@ mod tests {
             Some(json!({"text": big_text})),
             Outcome::Ok,
             0,
+            None,
         );
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1078,5 +1113,49 @@ mod tests {
         );
         let (severity, _) = otlp_attributes(&record);
         assert_eq!(severity, logs::Severity::Error);
+    }
+
+    #[test]
+    fn record_span_ctx_round_trips_the_stored_hex_fields() {
+        let mut record = Record::event(
+            "s".to_string(),
+            Transport::Http,
+            RecordScope::Write,
+            Event::ToolCall,
+        );
+        record.trace = Some("0af7651916cd43dd8448eb211c80319c".to_string());
+        record.span = Some("00f067aa0ba902b7".to_string());
+        let ctx = record_span_ctx(&record).expect("both fields present");
+        assert_eq!(ctx.trace_hex(), "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(ctx.span_hex(), "00f067aa0ba902b7");
+    }
+
+    #[test]
+    fn record_span_ctx_none_without_both_fields() {
+        let record = Record::event(
+            "s".to_string(),
+            Transport::Http,
+            RecordScope::Write,
+            Event::ToolCall,
+        );
+        assert!(record_span_ctx(&record).is_none());
+    }
+
+    #[test]
+    fn tool_call_with_trace_ids_serializes_trace_and_span_fields() {
+        let mut record = Record::event(
+            "s1".to_string(),
+            Transport::Http,
+            RecordScope::Read,
+            Event::ToolCall,
+        );
+        record.tool = Some("get_job".to_string());
+        record.outcome = Some(Outcome::Ok);
+        record.trace = Some("0af7651916cd43dd8448eb211c80319c".to_string());
+        record.span = Some("00f067aa0ba902b7".to_string());
+        assert_eq!(
+            line(&record),
+            r#"{"v":1,"ts":"","seq":0,"session":"s1","transport":"http","scope":"read","event":"tool_call","tool":"get_job","outcome":"ok","trace":"0af7651916cd43dd8448eb211c80319c","span":"00f067aa0ba902b7"}"#
+        );
     }
 }

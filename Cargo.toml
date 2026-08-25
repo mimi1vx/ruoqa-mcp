@@ -47,6 +47,7 @@ url = "2"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 wiremock = "0.6"

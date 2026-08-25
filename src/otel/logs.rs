@@ -2,6 +2,7 @@
 //! `tracing` `Layer`, and the field-capture `Visit` impl behind it.
 
 use super::proto::{self, Value};
+use super::traces::SpanCtx;
 
 /// `SeverityNumber`. Five values, not the full 24: `tracing` has exactly
 /// five levels, and the intra-level `*2`/`*3`/`*4` gradations the full OTLP
@@ -47,11 +48,17 @@ impl Severity {
 /// `observed_time_unix_nano` is set to `ts_unix_nanos` too: there is no
 /// separate observation step in this crate, the record is built and
 /// observed in the same call.
+///
+/// `span` correlates this record to a trace (E6): `Some` writes `flags` (8),
+/// `trace_id` (9) and `span_id` (10); `None` — every record with no active
+/// tool-call span, which includes every lifecycle and startup event — omits
+/// all three, which is the normal steady state, not a bug.
 pub(crate) fn encode_record(
     ts_unix_nanos: u64,
     severity: Severity,
     body: &str,
     attrs: &[(&str, Value<'_>)],
+    span: Option<SpanCtx>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     proto::write_fixed64(&mut buf, 1, ts_unix_nanos);
@@ -60,6 +67,11 @@ pub(crate) fn encode_record(
     proto::write_any_value(&mut buf, 5, &Value::Str(body));
     proto::write_attributes(&mut buf, 6, attrs);
     proto::write_fixed64(&mut buf, 11, ts_unix_nanos);
+    if let Some(span) = span {
+        proto::write_fixed32(&mut buf, 8, u32::from(span.sampled()));
+        proto::write_bytes(&mut buf, 9, &span.trace_id());
+        proto::write_bytes(&mut buf, 10, &span.span_id());
+    }
     buf
 }
 
@@ -248,11 +260,14 @@ where
         attrs.push(("code.target", Value::Str(meta.target())));
 
         let body = visitor.body.unwrap_or_default();
+        // `None` outside a tool call: every lifecycle and startup event.
+        let span = crate::server::CURRENT_SPAN.try_with(|c| *c).ok().flatten();
         let record = encode_record(
             now_unix_nanos(),
             Severity::from_level(*meta.level()),
             &body,
             &attrs,
+            span,
         );
         self.producer.enqueue(record);
     }
@@ -278,7 +293,7 @@ mod tests {
             (Severity::Warn, 13, "WARN"),
             (Severity::Error, 17, "ERROR"),
         ] {
-            let bytes = encode_record(42, severity, "hello", &[("k", Value::Str("v"))]);
+            let bytes = encode_record(42, severity, "hello", &[("k", Value::Str("v"))], None);
 
             let mut expected = Vec::new();
             proto::write_fixed64(&mut expected, 1, 42);
@@ -290,6 +305,24 @@ mod tests {
 
             assert_eq!(bytes, expected, "{severity:?}");
         }
+    }
+
+    #[test]
+    fn encode_record_with_span_writes_flags_trace_id_and_span_id() {
+        let span = SpanCtx::from_raw([1u8; 16], [2u8; 8], true);
+        let bytes = encode_record(42, Severity::Info, "hello", &[], Some(span));
+
+        let mut expected = Vec::new();
+        proto::write_fixed64(&mut expected, 1, 42);
+        proto::write_uint32(&mut expected, 2, Severity::Info as u32);
+        proto::write_string(&mut expected, 3, "INFO");
+        proto::write_any_value(&mut expected, 5, &Value::Str("hello"));
+        proto::write_fixed64(&mut expected, 11, 42);
+        proto::write_fixed32(&mut expected, 8, 1);
+        proto::write_bytes(&mut expected, 9, &[1u8; 16]);
+        proto::write_bytes(&mut expected, 10, &[2u8; 8]);
+
+        assert_eq!(bytes, expected);
     }
 
     #[test]
@@ -308,8 +341,8 @@ mod tests {
 
     #[test]
     fn encode_request_matches_hand_built_bytes() {
-        let r1 = encode_record(1, Severity::Info, "one", &[]);
-        let r2 = encode_record(2, Severity::Error, "two", &[]);
+        let r1 = encode_record(1, Severity::Info, "one", &[], None);
+        let r2 = encode_record(2, Severity::Error, "two", &[], None);
         let resource: Vec<(&str, Value<'_>)> = vec![("service.name", Value::Str("ruoqa-mcp"))];
         let bytes = encode_request(&resource, ("ruoqa-mcp", "1.2.3"), &[r1.clone(), r2.clone()]);
 

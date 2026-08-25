@@ -31,7 +31,13 @@ async fn startup_probe_success_and_fatal_failure() {
         .await;
 
     // SAFETY: no other test in this binary mutates OTEL_EXPORTER_OTLP_ENDPOINT.
-    unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri()) };
+    // This file predates the traces signal and is about the logs probe only;
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` would otherwise also light up a second,
+    // unasserted probe against the same collector.
+    unsafe {
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
+        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
+    }
 
     let telemetry = Telemetry::init()
         .await
@@ -89,7 +95,10 @@ async fn startup_probe_success_and_fatal_failure() {
         "a 503 collector must fail the startup probe"
     );
 
-    unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
+    unsafe {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
+    }
 }
 
 /// Navigates `ExportLogsServiceRequest -> ResourceLogs -> ScopeLogs` and

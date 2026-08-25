@@ -49,8 +49,7 @@ fn write_int64(buf: &mut Vec<u8>, field: u32, v: i64) {
     }
 }
 
-#[allow(dead_code, reason = "LogRecord.flags and span ids arrive in phase E")]
-fn write_fixed32(buf: &mut Vec<u8>, field: u32, v: u32) {
+pub(super) fn write_fixed32(buf: &mut Vec<u8>, field: u32, v: u32) {
     if v != 0 {
         write_tag(buf, field, WIRE_FIXED32);
         buf.extend_from_slice(&v.to_le_bytes());

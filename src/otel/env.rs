@@ -33,8 +33,8 @@ const DEFAULT_SCHEDULE_DELAY_MS: u64 = 5000;
 /// A `get`-style lookup, as `std::env::var(name).ok()` would produce.
 type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// The three OTLP signals this crate exports. Only `Logs` has a caller in
-/// this phase; the type stays signal-generic so phases E/F add a call site,
+/// The three OTLP signals this crate exports. `Metrics` has no caller before
+/// phase F; the type stays signal-generic so that phase adds a call site,
 /// not a copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Signal {
@@ -135,11 +135,19 @@ pub(crate) struct SignalConfig {
 pub(crate) struct OtelConfig {
     pub(crate) service_name: String,
     pub(crate) logs: Option<SignalConfig>,
-    #[allow(dead_code, reason = "the traces signal has no caller before phase E")]
     pub(crate) traces: Option<SignalConfig>,
     #[allow(dead_code, reason = "the metrics signal has no caller before phase F")]
     pub(crate) metrics: Option<SignalConfig>,
     pub(crate) queue: QueueConfig,
+    pub(crate) sampler: Sampler,
+}
+
+/// `OTEL_TRACES_SAMPLER`. Ratio samplers are out of scope; these two cover
+/// "always record" and "respect an inbound `traceparent`'s sampled bit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sampler {
+    AlwaysOn,
+    ParentBasedAlwaysOn,
 }
 
 /// An `OTEL_*` variable could not be resolved into a valid configuration.
@@ -158,6 +166,13 @@ pub(crate) enum EnvError {
     },
     UnsupportedCompression {
         var: String,
+        value: String,
+    },
+    UnsupportedExporter {
+        var: String,
+        value: String,
+    },
+    UnsupportedSampler {
         value: String,
     },
     UnsupportedTlsOption {
@@ -196,6 +211,15 @@ impl fmt::Display for EnvError {
             EnvError::UnsupportedCompression { var, value } => write!(
                 f,
                 "{var} is set to {value:?}, but compression is not supported (use \"none\")"
+            ),
+            EnvError::UnsupportedExporter { var, value } => write!(
+                f,
+                "{var} is set to {value:?}, but only \"otlp\" and \"none\" are supported"
+            ),
+            EnvError::UnsupportedSampler { value } => write!(
+                f,
+                "OTEL_TRACES_SAMPLER is set to {value:?}, but only \"always_on\" and \
+                 \"parentbased_always_on\" are supported"
             ),
             EnvError::UnsupportedTlsOption { var } => {
                 write!(f, "{var} is set, but custom TLS material is not supported")
@@ -334,11 +358,29 @@ fn resolve_timeout(get: Lookup<'_>, signal: Signal) -> Result<Duration, EnvError
     )?))
 }
 
+/// `OTEL_EXPORTER_OTLP_<SIGNAL>_EXPORTER`: `otlp` (default) or `none`. `none`
+/// is the per-signal off switch, checked before any endpoint work — an
+/// explicit opt-out costs no URL parse and no probe.
+fn resolve_exporter(get: Lookup<'_>, signal: Signal) -> Result<bool, EnvError> {
+    let var = var_name(Some(signal), "_EXPORTER");
+    match lookup(get, &var).as_deref() {
+        None | Some("otlp") => Ok(true),
+        Some("none") => Ok(false),
+        Some(other) => Err(EnvError::UnsupportedExporter {
+            var,
+            value: other.to_string(),
+        }),
+    }
+}
+
 fn resolve_signal(
     get: Lookup<'_>,
     signal: Signal,
     base_endpoint: Option<&str>,
 ) -> Result<Option<SignalConfig>, EnvError> {
+    if !resolve_exporter(get, signal)? {
+        return Ok(None);
+    }
     validate_protocol(get, Some(signal))?;
     validate_compression(get, Some(signal))?;
     validate_no_tls_material(get, Some(signal))?;
@@ -382,6 +424,20 @@ fn resolve_queue(get: Lookup<'_>) -> Result<QueueConfig, EnvError> {
     })
 }
 
+/// `OTEL_TRACES_SAMPLER`: `always_on` (default) or `parentbased_always_on`.
+/// Validated unconditionally, like the other base variables above, whether
+/// or not the traces signal ends up configured — a typo here is a startup
+/// error either way, not a silently ignored one.
+fn resolve_sampler(get: Lookup<'_>) -> Result<Sampler, EnvError> {
+    match lookup(get, "OTEL_TRACES_SAMPLER").as_deref() {
+        None | Some("always_on") => Ok(Sampler::AlwaysOn),
+        Some("parentbased_always_on") => Ok(Sampler::ParentBasedAlwaysOn),
+        Some(other) => Err(EnvError::UnsupportedSampler {
+            value: other.to_string(),
+        }),
+    }
+}
+
 /// Resolves the full `OTEL_*` configuration from a lookup closure. `Ok(None)`
 /// when no signal is configured (or `OTEL_SDK_DISABLED=true`) — the off
 /// switch is either state, and the caller must build nothing at all.
@@ -393,6 +449,7 @@ pub(crate) fn resolve(get: Lookup<'_>) -> Result<Option<OtelConfig>, EnvError> {
     validate_protocol(get, None)?;
     validate_compression(get, None)?;
     validate_no_tls_material(get, None)?;
+    let sampler = resolve_sampler(get)?;
 
     let base_endpoint = lookup(get, "OTEL_EXPORTER_OTLP_ENDPOINT");
     let logs = resolve_signal(get, Signal::Logs, base_endpoint.as_deref())?;
@@ -413,6 +470,7 @@ pub(crate) fn resolve(get: Lookup<'_>) -> Result<Option<OtelConfig>, EnvError> {
         traces,
         metrics,
         queue,
+        sampler,
     }))
 }
 
@@ -684,5 +742,87 @@ mod tests {
         let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn exporter_default_and_otlp_are_the_same_as_unset() {
+        for value in [None, Some("otlp")] {
+            let mut vars = HashMap::from([("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318")]);
+            if let Some(v) = value {
+                vars.insert("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", v);
+            }
+            let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+            assert!(cfg.traces.is_some(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn exporter_none_disables_only_that_signal() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none"),
+        ]);
+        let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+        assert!(cfg.traces.is_none());
+        assert!(cfg.logs.is_some());
+    }
+
+    #[test]
+    fn exporter_none_costs_no_url_parse_even_with_a_bad_signal_endpoint() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none"),
+            ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "not a url"),
+        ]);
+        assert!(resolve(&lookup_from(&vars)).unwrap().is_some());
+    }
+
+    #[test]
+    fn exporter_invalid_value_is_an_error() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "grpc"),
+        ]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::UnsupportedExporter { .. }
+        ));
+    }
+
+    #[test]
+    fn sampler_default_and_explicit_values() {
+        for (value, expected) in [
+            (None, Sampler::AlwaysOn),
+            (Some("always_on"), Sampler::AlwaysOn),
+            (Some("parentbased_always_on"), Sampler::ParentBasedAlwaysOn),
+        ] {
+            let mut vars = HashMap::from([("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318")]);
+            if let Some(v) = value {
+                vars.insert("OTEL_TRACES_SAMPLER", v);
+            }
+            let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+            assert_eq!(cfg.sampler, expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn sampler_unknown_value_is_an_error() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_TRACES_SAMPLER", "ratio"),
+        ]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::UnsupportedSampler { .. }
+        ));
+    }
+
+    #[test]
+    fn sampler_is_validated_even_with_no_signal_configured() {
+        let vars = HashMap::from([("OTEL_TRACES_SAMPLER", "ratio")]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::UnsupportedSampler { .. }
+        ));
     }
 }

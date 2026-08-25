@@ -15,12 +15,127 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
+use crate::TraceProducer;
 use crate::audit::{self, Auditor, Outcome, RecordScope, Transport};
 use crate::error::{classify, kind_of, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
+use crate::otel::{self, traces::SpanCtx};
 use crate::servers::ServerRegistry;
+
+tokio::task_local! {
+    /// The current tool call's span context. Set once per `call_tool`, read
+    /// by `request_json`/`request_form`, `tools::artifact::execute`, the
+    /// diagnostics `Layer` and the audit bridge.
+    ///
+    /// Inherited by `.await`ed futures on the same task only: a
+    /// `tokio::spawn` inside a tool call would NOT see it and its spans
+    /// would silently become roots. No such spawn exists today
+    /// (`with_heartbeat` uses `select!`, same task); adding one means
+    /// passing the context explicitly.
+    pub(crate) static CURRENT_SPAN: Option<SpanCtx>;
+
+    /// The trace producer active for the current tool call, scoped
+    /// alongside [`CURRENT_SPAN`]. A second task-local rather than folding
+    /// into `CURRENT_SPAN` itself: the diagnostics `Layer` and the audit
+    /// bridge only ever need the span *ids*, never a way to enqueue one.
+    static CURRENT_TRACE_PRODUCER: Option<TraceProducer>;
+}
+
+/// Encodes and enqueues an `openqa.request` CLIENT child span, if a
+/// tool-call span is active on this task. Shared by `request_json`/
+/// `request_form` and `tools::artifact::execute`, which cannot reach either
+/// of those helpers directly (Range requests and raw bytes bypass them).
+/// Never a query string, never a body.
+pub(crate) fn record_upstream_span(
+    method: &str,
+    path: &str,
+    start_wall_nanos: u64,
+    end_wall_nanos: u64,
+    error_kind: Option<&str>,
+) {
+    let Some(current) = CURRENT_SPAN.try_with(|c| *c).ok().flatten() else {
+        return;
+    };
+    let Some(traces) = CURRENT_TRACE_PRODUCER.try_with(Clone::clone).ok().flatten() else {
+        return;
+    };
+    let Some(child) = current.child() else {
+        return;
+    };
+    let attrs = [
+        ("http.request.method", otel::proto::Value::Str(method)),
+        ("url.path", otel::proto::Value::Str(path)),
+    ];
+    let span = otel::traces::encode_span(
+        child,
+        Some(current.span_id()),
+        "openqa.request",
+        otel::traces::SpanKind::Client,
+        start_wall_nanos,
+        end_wall_nanos,
+        &attrs,
+        error_kind,
+    );
+    traces.enqueue(span);
+}
+
+/// Encodes and enqueues one `mcp.tool/<tool>` SERVER span for a completed
+/// tool call, with the same `tool`/`server`/`scope`/`outcome`/`error.kind`
+/// values the DEBUG diagnostics event and the audit record already carry.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the span's attribute set"
+)]
+fn emit_tool_span(
+    traces: &TraceProducer,
+    ctx: SpanCtx,
+    parent_span_id: Option<[u8; 8]>,
+    tool: &str,
+    scope: RecordScope,
+    outcome: &Outcome,
+    server: Option<&str>,
+    error_kind: Option<&str>,
+    start_wall_nanos: u64,
+) {
+    let outcome_str = match outcome {
+        Outcome::Ok => "ok",
+        Outcome::ToolError { .. } => "tool_error",
+        Outcome::ProtocolError { .. } => "protocol_error",
+    };
+    let mut attrs: Vec<(&str, otel::proto::Value<'_>)> = vec![
+        ("tool", otel::proto::Value::Str(tool)),
+        ("scope", otel::proto::Value::Str(scope_str(scope))),
+        ("outcome", otel::proto::Value::Str(outcome_str)),
+    ];
+    if let Some(server) = server {
+        attrs.push(("server", otel::proto::Value::Str(server)));
+    }
+    if let Some(kind) = error_kind {
+        attrs.push(("error.kind", otel::proto::Value::Str(kind)));
+    }
+    let name = format!("mcp.tool/{tool}");
+    let span_bytes = otel::traces::encode_span(
+        ctx,
+        parent_span_id,
+        &name,
+        otel::traces::SpanKind::Server,
+        start_wall_nanos,
+        otel::logs::now_unix_nanos(),
+        &attrs,
+        error_kind,
+    );
+    traces.enqueue(span_bytes);
+}
+
+fn scope_str(scope: RecordScope) -> &'static str {
+    match scope {
+        RecordScope::Read => "read",
+        RecordScope::Write => "write",
+        RecordScope::None => "none",
+    }
+}
 
 const INSTRUCTIONS: &str = "Query and control an openQA instance. Read tools inspect jobs, \
 machines, test suites, and products; mutating tools restart/cancel/delete jobs, comment, and \
@@ -50,6 +165,9 @@ pub struct OpenQaServer {
     /// Which transport is serving this instance, carried onto every audit
     /// record.
     transport: Transport,
+    /// The traces stream. `None` means traces are off: `call_tool` does no
+    /// encoding, no allocation, and never enters [`CURRENT_SPAN`]'s scope.
+    traces: Option<TraceProducer>,
 }
 
 impl OpenQaServer {
@@ -80,6 +198,7 @@ impl OpenQaServer {
             call_timeout: Some(DEFAULT_CALL_TIMEOUT),
             audit: None,
             transport: Transport::Stdio,
+            traces: None,
         }
     }
 
@@ -110,6 +229,13 @@ impl OpenQaServer {
     #[must_use]
     pub fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Set the traces stream; `None` (the default) disables it entirely.
+    #[must_use]
+    pub fn with_traces(mut self, traces: Option<TraceProducer>) -> Self {
+        self.traces = traces;
         self
     }
 
@@ -171,9 +297,17 @@ impl OpenQaServer {
     ) -> ruoqa::Result<Value> {
         let token = ctx.meta.get_progress_token();
         let start = Instant::now();
+        let start_wall = otel::logs::now_unix_nanos();
         let result =
             with_heartbeat(&ctx.peer, token, client.request(method.clone(), path, None)).await;
         log_upstream_request(&method, path, start.elapsed(), &result);
+        record_upstream_span(
+            method.as_str(),
+            path,
+            start_wall,
+            otel::logs::now_unix_nanos(),
+            result.as_ref().err().map(kind_of),
+        );
         result
     }
 
@@ -189,6 +323,7 @@ impl OpenQaServer {
         let token = ctx.meta.get_progress_token();
         let pairs = form.pairs();
         let start = Instant::now();
+        let start_wall = otel::logs::now_unix_nanos();
         let result = with_heartbeat(
             &ctx.peer,
             token,
@@ -196,6 +331,13 @@ impl OpenQaServer {
         )
         .await;
         log_upstream_request(&method, path, start.elapsed(), &result);
+        record_upstream_span(
+            method.as_str(),
+            path,
+            start_wall,
+            otel::logs::now_unix_nanos(),
+            result.as_ref().err().map(kind_of),
+        );
         result
     }
 
@@ -385,6 +527,7 @@ impl ServerHandler for OpenQaServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let start = Instant::now();
+        let start_wall_nanos = otel::logs::now_unix_nanos();
         let tool = request.name.to_string();
         let scope = self.record_scope(&tool);
         let server_selector = request
@@ -401,7 +544,27 @@ impl ServerHandler for OpenQaServer {
             )
         });
 
-        let result = self.dispatch(request, context).await;
+        // `None` when traces are off or the sampler skipped this call: no
+        // encoding, no allocation, and `CURRENT_SPAN`'s scope is never
+        // entered below.
+        let span = self.traces.as_ref().and_then(|traces| {
+            let traceparent = context.meta.get_traceparent();
+            otel::traces::start_call_span(traces.sampler(), traceparent)
+                .map(|(ctx, parent)| (ctx, parent, traces.clone()))
+        });
+
+        let result = match &span {
+            Some((ctx, _, traces)) => {
+                CURRENT_SPAN
+                    .scope(
+                        Some(*ctx),
+                        CURRENT_TRACE_PRODUCER
+                            .scope(Some(traces.clone()), self.dispatch(request, context)),
+                    )
+                    .await
+            }
+            None => self.dispatch(request, context).await,
+        };
 
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let server = server_selector
@@ -422,6 +585,23 @@ impl ServerHandler for OpenQaServer {
             "tool call"
         );
 
+        let trace_ids = span
+            .as_ref()
+            .map(|(ctx, _, _)| (ctx.trace_hex(), ctx.span_hex()));
+        if let Some((ctx, parent_span_id, traces)) = span {
+            emit_tool_span(
+                &traces,
+                ctx,
+                parent_span_id,
+                &tool,
+                scope,
+                &outcome,
+                server.as_deref(),
+                error_kind,
+                start_wall_nanos,
+            );
+        }
+
         if let (Some(audit), Some((args, session))) = (audit, args_and_session) {
             audit.tool_call(
                 session,
@@ -432,6 +612,7 @@ impl ServerHandler for OpenQaServer {
                 args,
                 outcome,
                 duration_ms,
+                trace_ids,
             );
         }
         result

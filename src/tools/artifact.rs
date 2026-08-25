@@ -286,21 +286,31 @@ fn insert_range(prepared: &mut PreparedRequest, value: &str) {
     );
 }
 
-/// Known gap: this bypasses `OpenQaServer::request_json`/`request_form`
-/// entirely (Range headers and raw bytes need `client.prepare`/`execute`
-/// directly), so `list_job_logs`, `get_job_log`, `list_job_log_members` and
-/// `get_job_log_errors` produce no upstream-request diagnostics event.
-/// Closing this costs one edit here rather than two once this call site
-/// needs touching again for spans.
+/// This bypasses `OpenQaServer::request_json`/`request_form` entirely
+/// (Range headers and raw bytes need `client.prepare`/`execute` directly),
+/// so it records its own `openqa.request` CLIENT span rather than sharing
+/// theirs — the single funnel for `probe`, `fetch_tail` and `fetch_all`, and
+/// therefore for all four artifact tools.
 async fn execute(
     client: &ruoqa::Client,
     ctx: &RequestContext<RoleServer>,
     prepared: &PreparedRequest,
 ) -> Result<reqwest::Response, Bail> {
     let token = ctx.meta.get_progress_token();
-    with_heartbeat(&ctx.peer, token, client.execute(prepared, false))
-        .await
-        .map_err(classify)
+    let start_wall = crate::otel::logs::now_unix_nanos();
+    let result = with_heartbeat(&ctx.peer, token, client.execute(prepared, false)).await;
+    // `result`'s error is a `ruoqa::Error`, but the span only needs to know
+    // *that* the request failed, not classify it the way `classify` does for
+    // the caller-visible response — "upstream" says enough for a trace, and
+    // avoids a second, parallel classification of the same error.
+    crate::server::record_upstream_span(
+        prepared.method.as_str(),
+        prepared.url.path(),
+        start_wall,
+        crate::otel::logs::now_unix_nanos(),
+        result.is_err().then_some("upstream"),
+    );
+    result.map_err(classify)
 }
 
 /// openQA never requires auth for `/tests/*/file/*`; a response whose final

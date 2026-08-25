@@ -93,6 +93,7 @@ async fn default_filter_passes_info_blocks_debug_and_excluded_targets() {
     unsafe {
         std::env::remove_var("RUST_LOG");
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
+        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
     }
 
     let telemetry = Telemetry::init()
@@ -130,7 +131,10 @@ async fn default_filter_passes_info_blocks_debug_and_excluded_targets() {
         "the debug event and the excluded-target event must not have exported"
     );
 
-    unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
+    unsafe {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
+    };
 }
 
 /// `RUST_LOG=debug` widens the diagnostics filter's default: both an INFO
@@ -149,6 +153,7 @@ async fn rust_log_debug_widens_the_diagnostics_filter() {
     unsafe {
         std::env::set_var("RUST_LOG", "debug");
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
+        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
     }
 
     let telemetry = Telemetry::init()
@@ -184,6 +189,7 @@ async fn rust_log_debug_widens_the_diagnostics_filter() {
     unsafe {
         std::env::remove_var("RUST_LOG");
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
     }
 }
 
@@ -204,6 +210,7 @@ async fn audit_bridge_shares_the_endpoint_and_is_separable_by_stream() {
     unsafe {
         std::env::remove_var("RUST_LOG");
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
+        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
     }
 
     let telemetry = Telemetry::init()
@@ -236,6 +243,7 @@ async fn audit_bridge_shares_the_endpoint_and_is_separable_by_stream() {
         Some(json!({"text": "lgtm"})),
         Outcome::Ok,
         7,
+        None,
     );
 
     // No sleep between the calls above and this flush: also proves records
@@ -290,5 +298,8 @@ async fn audit_bridge_shares_the_endpoint_and_is_separable_by_stream() {
         Some("diagnostics alongside audit")
     );
 
-    unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
+    unsafe {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
+    };
 }
