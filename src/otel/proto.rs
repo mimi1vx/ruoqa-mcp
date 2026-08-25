@@ -3,10 +3,6 @@
 //! Field numbers are read off `opentelemetry-proto v1.11.0`
 //! (<https://github.com/open-telemetry/opentelemetry-proto/tree/v1.11.0>).
 //! Later phases must read their field numbers from the same tag.
-#![allow(
-    dead_code,
-    reason = "consumed by the export pipeline in the next commit"
-)]
 
 const WIRE_VARINT: u32 = 0;
 const WIRE_FIXED64: u32 = 1;
@@ -29,6 +25,10 @@ fn write_tag(buf: &mut Vec<u8>, field: u32, wire: u32) {
     write_varint(buf, u64::from((field << 3) | wire));
 }
 
+#[allow(
+    dead_code,
+    reason = "AnyValue::Bool has no caller before phase F (metrics)"
+)]
 fn write_bool(buf: &mut Vec<u8>, field: u32, v: bool) {
     if v {
         write_tag(buf, field, WIRE_VARINT);
@@ -36,7 +36,7 @@ fn write_bool(buf: &mut Vec<u8>, field: u32, v: bool) {
     }
 }
 
-fn write_uint32(buf: &mut Vec<u8>, field: u32, v: u32) {
+pub(super) fn write_uint32(buf: &mut Vec<u8>, field: u32, v: u32) {
     if v != 0 {
         write_tag(buf, field, WIRE_VARINT);
         write_varint(buf, u64::from(v));
@@ -46,6 +46,10 @@ fn write_uint32(buf: &mut Vec<u8>, field: u32, v: u32) {
 /// `int64` is plain varint, not zigzag — `sint64` is the zigzag variant and
 /// OTLP does not use it. A negative value two's-complement-reinterprets as
 /// `u64`, producing the correct ten-byte varint.
+#[allow(
+    dead_code,
+    reason = "no integer attribute is emitted before phase D's seq-style attrs"
+)]
 fn write_int64(buf: &mut Vec<u8>, field: u32, v: i64) {
     if v != 0 {
         write_tag(buf, field, WIRE_VARINT);
@@ -53,6 +57,7 @@ fn write_int64(buf: &mut Vec<u8>, field: u32, v: i64) {
     }
 }
 
+#[allow(dead_code, reason = "LogRecord.flags and span ids arrive in phase E")]
 fn write_fixed32(buf: &mut Vec<u8>, field: u32, v: u32) {
     if v != 0 {
         write_tag(buf, field, WIRE_FIXED32);
@@ -60,13 +65,17 @@ fn write_fixed32(buf: &mut Vec<u8>, field: u32, v: u32) {
     }
 }
 
-fn write_fixed64(buf: &mut Vec<u8>, field: u32, v: u64) {
+pub(super) fn write_fixed64(buf: &mut Vec<u8>, field: u32, v: u64) {
     if v != 0 {
         write_tag(buf, field, WIRE_FIXED64);
         buf.extend_from_slice(&v.to_le_bytes());
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Histogram/gauge data points have no caller before phase F"
+)]
 fn write_double(buf: &mut Vec<u8>, field: u32, v: f64) {
     if v != 0.0 {
         write_tag(buf, field, WIRE_FIXED64);
@@ -74,13 +83,13 @@ fn write_double(buf: &mut Vec<u8>, field: u32, v: f64) {
     }
 }
 
-fn write_string(buf: &mut Vec<u8>, field: u32, v: &str) {
+pub(super) fn write_string(buf: &mut Vec<u8>, field: u32, v: &str) {
     if !v.is_empty() {
         write_bytes(buf, field, v.as_bytes());
     }
 }
 
-fn write_bytes(buf: &mut Vec<u8>, field: u32, v: &[u8]) {
+pub(super) fn write_bytes(buf: &mut Vec<u8>, field: u32, v: &[u8]) {
     if !v.is_empty() {
         write_tag(buf, field, WIRE_LEN);
         write_varint(buf, v.len() as u64);
@@ -88,6 +97,10 @@ fn write_bytes(buf: &mut Vec<u8>, field: u32, v: &[u8]) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Histogram bucket counts have no caller before phase F"
+)]
 fn write_packed_fixed64(buf: &mut Vec<u8>, field: u32, values: &[u64]) {
     if values.is_empty() {
         return;
@@ -99,6 +112,10 @@ fn write_packed_fixed64(buf: &mut Vec<u8>, field: u32, values: &[u64]) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Histogram explicit bounds have no caller before phase F"
+)]
 fn write_packed_double(buf: &mut Vec<u8>, field: u32, values: &[f64]) {
     if values.is_empty() {
         return;
@@ -117,7 +134,7 @@ fn write_packed_double(buf: &mut Vec<u8>, field: u32, values: &[f64]) {
 /// deep (`LogsData -> ResourceLogs -> ScopeLogs -> LogRecord`), so the total
 /// shifting stays a small constant factor over the payload — do not
 /// "optimise" this into a scratch-`Vec` scheme for that depth.
-fn write_message(buf: &mut Vec<u8>, field: u32, body: impl FnOnce(&mut Vec<u8>)) {
+pub(super) fn write_message(buf: &mut Vec<u8>, field: u32, body: impl FnOnce(&mut Vec<u8>)) {
     write_tag(buf, field, WIRE_LEN);
     let start = buf.len();
     body(buf);
@@ -129,16 +146,28 @@ fn write_message(buf: &mut Vec<u8>, field: u32, body: impl FnOnce(&mut Vec<u8>))
 
 /// The `AnyValue` subset this crate emits. Arrays, kvlists and bytes are
 /// deliberately absent: every attribute we produce is a scalar.
-enum Value<'a> {
+pub(crate) enum Value<'a> {
     Str(&'a str),
+    #[allow(
+        dead_code,
+        reason = "no integer attribute is emitted before phase D's seq-style attrs"
+    )]
     Int(i64),
+    #[allow(
+        dead_code,
+        reason = "no bool attribute has a caller before phase F (metrics)"
+    )]
     Bool(bool),
+    #[allow(
+        dead_code,
+        reason = "no double attribute has a caller before phase F (metrics)"
+    )]
     Double(f64),
 }
 
 /// `AnyValue`: a oneof over field numbers 1 (`string_value`), 2
 /// (`bool_value`), 3 (`int_value`) and 4 (`double_value`).
-fn write_any_value(buf: &mut Vec<u8>, field: u32, v: &Value<'_>) {
+pub(super) fn write_any_value(buf: &mut Vec<u8>, field: u32, v: &Value<'_>) {
     write_message(buf, field, |b| match *v {
         Value::Str(s) => write_string(b, 1, s),
         Value::Bool(bool_v) => write_bool(b, 2, bool_v),
@@ -148,14 +177,14 @@ fn write_any_value(buf: &mut Vec<u8>, field: u32, v: &Value<'_>) {
 }
 
 /// `KeyValue`: `key` at field 1, `value` at field 2.
-fn write_key_value(buf: &mut Vec<u8>, field: u32, key: &str, v: &Value<'_>) {
+pub(super) fn write_key_value(buf: &mut Vec<u8>, field: u32, key: &str, v: &Value<'_>) {
     write_message(buf, field, |b| {
         write_string(b, 1, key);
         write_any_value(b, 2, v);
     });
 }
 
-fn write_attributes(buf: &mut Vec<u8>, field: u32, attrs: &[(&str, Value<'_>)]) {
+pub(super) fn write_attributes(buf: &mut Vec<u8>, field: u32, attrs: &[(&str, Value<'_>)]) {
     for (key, value) in attrs {
         write_key_value(buf, field, key, value);
     }
@@ -163,12 +192,12 @@ fn write_attributes(buf: &mut Vec<u8>, field: u32, attrs: &[(&str, Value<'_>)]) 
 
 /// `Resource`: `attributes` at field 1. `dropped_attributes_count` (field 2)
 /// is never written — we drop nothing, and proto3 omits zero-valued scalars.
-fn write_resource(buf: &mut Vec<u8>, field: u32, attrs: &[(&str, Value<'_>)]) {
+pub(super) fn write_resource(buf: &mut Vec<u8>, field: u32, attrs: &[(&str, Value<'_>)]) {
     write_message(buf, field, |b| write_attributes(b, 1, attrs));
 }
 
 /// `InstrumentationScope`: `name` at field 1, `version` at field 2.
-fn write_scope(buf: &mut Vec<u8>, field: u32, name: &str, version: &str) {
+pub(super) fn write_scope(buf: &mut Vec<u8>, field: u32, name: &str, version: &str) {
     write_message(buf, field, |b| {
         write_string(b, 1, name);
         write_string(b, 2, version);

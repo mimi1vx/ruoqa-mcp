@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use ruoqa_mcp::audit::{AuditConfig, Auditor, Transport};
 use ruoqa_mcp::http::{AuthConfigError, HttpAuth, HttpEnv, allowed_hosts, router};
 use ruoqa_mcp::servers::build_registry;
-use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer};
+use ruoqa_mcp::{Cli, EnvConfig, OpenQaServer, Telemetry};
 
 fn main() -> anyhow::Result<()> {
     // Before the runtime, and therefore before any other thread exists.
@@ -106,6 +106,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // Config -> sink, before the registry and well before a socket is bound.
     let audit = build_auditor(cli.audit_config.as_deref())?;
 
+    // Preflight, same as the audit sink above: the startup probe is fatal on
+    // both transports, so it must resolve and complete before anything else
+    // stands up. `None` when no `OTEL_*` variable is set — off means off, no
+    // client, no task, no allocation.
+    let telemetry = Telemetry::init().await?;
+
     let servers =
         build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;
     ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
@@ -123,6 +129,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         && let Some(audit) = &audit
     {
         audit.shutdown(audit.process_session(), transport);
+    }
+    // Unconditional, unlike the audit shutdown above: telemetry about a
+    // failing run is the most valuable kind, and the 5 s budget bounds the
+    // cost. The stdio path's `process::exit(0)` runs no destructors, so this
+    // is the only flush that ever happens.
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown().await;
     }
     result
 }
