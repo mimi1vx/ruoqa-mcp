@@ -142,10 +142,6 @@ impl std::error::Error for ServerConfigError {
 /// [`ServerConfigError::DuplicateServerId`] if two entries (or an entry and
 /// an alias) resolve to the same id, or [`ServerConfigError::Client`] if any
 /// entry's `ClientBuilder::build()` fails.
-#[allow(
-    clippy::result_large_err,
-    reason = "ServerConfigError::Client wraps ruoqa::Error as-is, same as ClientBuilder::build"
-)]
 pub fn build_registry(env: &EnvConfig) -> std::result::Result<ServerRegistry, ServerConfigError> {
     let entries = split_servers(env.server.as_deref());
     if entries.len() > 1 && (env.api_key_set || env.api_secret_set) {
@@ -167,10 +163,6 @@ pub fn build_registry(env: &EnvConfig) -> std::result::Result<ServerRegistry, Se
     Ok(ServerRegistry { clients })
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "ServerConfigError::Client wraps ruoqa::Error as-is, same as ClientBuilder::build"
-)]
 fn insert_unique(
     map: &mut HashMap<String, ruoqa::Client>,
     id: String,

@@ -44,10 +44,6 @@ impl std::error::Error for InvalidDuration {}
 ///
 /// Returns [`Error::Config`] if `raw` names a CA bundle path that cannot be
 /// read or parsed as PEM certificates.
-#[allow(
-    clippy::result_large_err,
-    reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
-)]
 pub fn parse_verify(raw: Option<&str>) -> Result<TlsMode> {
     let token = raw.map_or("", str::trim);
     let lowered = token.to_lowercase();
@@ -186,10 +182,6 @@ impl EnvConfig {
 /// `ClientBuilder::build`'s errors, including
 /// [`Error::IncompleteCredentials`] when the environment sets only one
 /// half of a credential pair.
-#[allow(
-    clippy::result_large_err,
-    reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
-)]
 pub fn build_client(env: &EnvConfig) -> Result<Client> {
     build_one(env, env.server.as_deref().unwrap_or_default())
 }
@@ -197,10 +189,6 @@ pub fn build_client(env: &EnvConfig) -> Result<Client> {
 /// Build a single `Client` for `server`, sharing `env`'s tls/timeout/
 /// config-path settings. Used by [`build_client`] for the single-server case
 /// and by [`crate::servers::build_registry`] once per `OPENQA_SERVER` entry.
-#[allow(
-    clippy::result_large_err,
-    reason = "propagates ruoqa::Error as-is, same as ClientBuilder::build"
-)]
 pub(crate) fn build_one(env: &EnvConfig, server: &str) -> Result<Client> {
     let tls = parse_verify(env.verify.as_deref())?;
     let timeouts = parse_timeout(env.timeout.as_deref()).map_err(|e| Error::Config(Box::new(e)))?;

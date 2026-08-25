@@ -97,7 +97,7 @@ mod tests {
     fn request_error(status: u16, body: &str) -> ruoqa::Error {
         ruoqa::Error::Request {
             method: Method::GET,
-            url: Url::parse("https://openqa.example/api/v1/jobs/1").unwrap(),
+            url: Box::new(Url::parse("https://openqa.example/api/v1/jobs/1").unwrap()),
             status: StatusCode::from_u16(status).unwrap(),
             body: body.to_string(),
         }
@@ -162,7 +162,7 @@ mod tests {
             .await
             .expect_err("connecting to port 0 must fail");
         let e = ruoqa::Error::Connection {
-            url: Url::parse("http://127.0.0.1:0").unwrap(),
+            url: Box::new(Url::parse("http://127.0.0.1:0").unwrap()),
             source,
         };
         let result = classify(e).unwrap();

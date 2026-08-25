@@ -146,10 +146,6 @@ impl OpenQaServer {
     }
 
     /// GET (or other body-less request) under a heartbeat.
-    #[allow(
-        clippy::result_large_err,
-        reason = "ruoqa::Client::request returns ruoqa::Result<Value> as-is; every tool matches on it via to_result/classify"
-    )]
     pub(crate) async fn request_json(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -162,10 +158,6 @@ impl OpenQaServer {
     }
 
     /// Form-encoded write under a heartbeat.
-    #[allow(
-        clippy::result_large_err,
-        reason = "ruoqa::Client::request_form returns ruoqa::Result<Value> as-is; every tool matches on it via to_result/classify"
-    )]
     pub(crate) async fn request_form(
         &self,
         ctx: &RequestContext<RoleServer>,
