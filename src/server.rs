@@ -16,7 +16,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
 use crate::audit::{self, Auditor, Outcome, RecordScope, Transport};
-use crate::error::{classify, tool_error};
+use crate::error::{classify, kind_of, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
@@ -113,6 +113,12 @@ impl OpenQaServer {
         self
     }
 
+    /// How many tools this instance exposes, for the startup lifecycle event.
+    #[must_use]
+    pub fn tool_count(&self) -> usize {
+        self.tool_router.list_all().len()
+    }
+
     /// Resolve a tool call's `server` argument, or an `invalid_params` error
     /// naming the configured set. The only place an unrecognized `server`
     /// value is rejected: a lookup into an operator-configured allow-list,
@@ -164,7 +170,11 @@ impl OpenQaServer {
         path: &str,
     ) -> ruoqa::Result<Value> {
         let token = ctx.meta.get_progress_token();
-        with_heartbeat(&ctx.peer, token, client.request(method, path, None)).await
+        let start = Instant::now();
+        let result =
+            with_heartbeat(&ctx.peer, token, client.request(method.clone(), path, None)).await;
+        log_upstream_request(&method, path, start.elapsed(), &result);
+        result
     }
 
     /// Form-encoded write under a heartbeat.
@@ -178,7 +188,15 @@ impl OpenQaServer {
     ) -> ruoqa::Result<Value> {
         let token = ctx.meta.get_progress_token();
         let pairs = form.pairs();
-        with_heartbeat(&ctx.peer, token, client.request_form(method, path, &pairs)).await
+        let start = Instant::now();
+        let result = with_heartbeat(
+            &ctx.peer,
+            token,
+            client.request_form(method.clone(), path, &pairs),
+        )
+        .await;
+        log_upstream_request(&method, path, start.elapsed(), &result);
+        result
     }
 
     /// The macro's body, gated on the caller's scope: `authorize` then
@@ -208,6 +226,32 @@ impl OpenQaServer {
             },
             None => dispatch.await,
         }
+    }
+}
+
+/// DEBUG diagnostics for one upstream openQA request: method, path,
+/// duration, and ok/error kind. Never the response body, never a query
+/// string — a caller passes `path` as the bare resource path, and this
+/// never looks at the response.
+fn log_upstream_request(
+    method: &Method,
+    path: &str,
+    elapsed: Duration,
+    result: &ruoqa::Result<Value>,
+) {
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(_) => {
+            tracing::debug!(method = %method, path, duration_ms, ok = true, "upstream request");
+        }
+        Err(e) => tracing::debug!(
+            method = %method,
+            path,
+            duration_ms,
+            ok = false,
+            "error.kind" = kind_of(e),
+            "upstream request"
+        ),
     }
 }
 
@@ -328,18 +372,18 @@ impl ServerHandler for OpenQaServer {
         std::future::ready(Ok(info))
     }
 
-    /// The macro's body, gated on the caller's scope, wrapped in an audit
-    /// record when auditing is on. The audit wrapper encloses `dispatch`
-    /// (and therefore `authorize`): a refused write attempt is exactly what
-    /// the audit stream exists to record.
+    /// The macro's body, gated on the caller's scope, always producing a
+    /// DEBUG diagnostics event and, when auditing is on, an audit record too
+    /// — one classification (`outcome_of`/`record_scope`), never two. Timing,
+    /// the `server` selector capture, and its resolution are hoisted out of
+    /// the audit-only branch so the diagnostics event fires whether or not
+    /// auditing is configured; only the audit-specific captures (arguments,
+    /// session id) stay inside `if let Some(audit)`.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(audit) = self.audit.clone() else {
-            return self.dispatch(request, context).await;
-        };
         let start = Instant::now();
         let tool = request.name.to_string();
         let scope = self.record_scope(&tool);
@@ -349,8 +393,13 @@ impl ServerHandler for OpenQaServer {
             .and_then(|a| a.get("server"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let args = audit::capture_args(request.arguments.as_ref());
-        let session = session_of(&context, audit.process_session());
+        let audit = self.audit.clone();
+        let args_and_session = audit.as_ref().map(|audit| {
+            (
+                audit::capture_args(request.arguments.as_ref()),
+                session_of(&context, audit.process_session()),
+            )
+        });
 
         let result = self.dispatch(request, context).await;
 
@@ -358,16 +407,33 @@ impl ServerHandler for OpenQaServer {
         let server = server_selector
             .as_deref()
             .and_then(|s| self.servers.resolve_id(s));
-        audit.tool_call(
-            session,
-            self.transport,
-            scope,
-            tool,
-            server,
-            args,
-            outcome_of(&result),
+        let outcome = outcome_of(&result);
+        let error_kind = match &outcome {
+            Outcome::ToolError { kind, .. } => Some(kind.as_str()),
+            Outcome::Ok | Outcome::ProtocolError { .. } => None,
+        };
+        tracing::debug!(
+            tool = %tool,
+            server = server.as_deref(),
+            scope = ?scope,
             duration_ms,
+            outcome = ?outcome,
+            "error.kind" = error_kind,
+            "tool call"
         );
+
+        if let (Some(audit), Some((args, session))) = (audit, args_and_session) {
+            audit.tool_call(
+                session,
+                self.transport,
+                scope,
+                tool,
+                server,
+                args,
+                outcome,
+                duration_ms,
+            );
+        }
         result
     }
 

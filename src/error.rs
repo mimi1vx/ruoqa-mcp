@@ -37,6 +37,20 @@ pub(crate) fn classify(e: ruoqa::Error) -> Result<CallToolResult, ErrorData> {
     }
 }
 
+/// The `kind` a `ruoqa::Error` would classify to, without consuming it or
+/// building a response. Used by the upstream-request diagnostics event,
+/// which only ever wants the label, never the body or a full [`classify`].
+pub(crate) fn kind_of(e: &ruoqa::Error) -> &'static str {
+    match e {
+        ruoqa::Error::Request { status, .. } => status_kind(status.as_u16()),
+        ruoqa::Error::Connection { .. } => "connection",
+        ruoqa::Error::DeadlineExceeded { .. } => "timeout",
+        ruoqa::Error::BodyTooLarge { .. } => "response_too_large",
+        ruoqa::Error::Parse(_) => "invalid_response",
+        _ => "internal",
+    }
+}
+
 /// Classify an HTTP status into the same `kind` vocabulary
 /// [`classify`] uses for `ruoqa::Error::Request`. Shared with
 /// `tools::artifact`, which maps status codes from raw (non-ruoqa) responses.
@@ -73,7 +87,9 @@ pub(crate) fn tool_error(
 
 /// Truncate `s` to at most `max_bytes` bytes, on a char boundary. Naive
 /// `&s[..max_bytes]` panics if it lands inside a multi-byte UTF-8 sequence.
-fn truncate(s: &str, max_bytes: usize) -> &str {
+/// Shared with `otel::logs`, which applies the same rule to diagnostics
+/// attributes and record bodies.
+pub(crate) fn truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

@@ -286,6 +286,12 @@ fn insert_range(prepared: &mut PreparedRequest, value: &str) {
     );
 }
 
+/// Known gap: this bypasses `OpenQaServer::request_json`/`request_form`
+/// entirely (Range headers and raw bytes need `client.prepare`/`execute`
+/// directly), so `list_job_logs`, `get_job_log`, `list_job_log_members` and
+/// `get_job_log_errors` produce no upstream-request diagnostics event.
+/// Closing this costs one edit here rather than two once this call site
+/// needs touching again for spans.
 async fn execute(
     client: &ruoqa::Client,
     ctx: &RequestContext<RoleServer>,

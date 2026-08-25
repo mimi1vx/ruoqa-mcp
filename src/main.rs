@@ -66,16 +66,35 @@ fn load_home_env() {
 }
 
 async fn serve() -> anyhow::Result<()> {
-    // Logging must go to stderr: anything on stdout corrupts the stdio JSON-RPC stream.
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    run(Cli::parse()).await
+    // `--help`/`--version` must work even with a dead collector configured,
+    // so this comes before telemetry. Preflight, fatal, still before any
+    // socket: resolve `OTEL_*`, probe the collector, start its export task.
+    let cli = Cli::parse();
+    let telemetry = Telemetry::init().await?;
+    init_tracing(telemetry.as_ref());
+    run(cli, telemetry).await
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Composes the stderr `fmt` layer (unchanged: `RUST_LOG`, ERROR default)
+/// with the OTLP diagnostics layer (`RUST_LOG`, INFO default) when telemetry
+/// is configured. `Option<Layer>` is itself a `Layer`, so "off means off"
+/// needs no `cfg` and no boxing: with no `OTEL_*` set, the registry holds
+/// exactly the one fmt layer.
+fn init_tracing(telemetry: Option<&Telemetry>) {
+    use tracing_subscriber::prelude::*;
+
+    // Logging must go to stderr: anything on stdout corrupts the stdio JSON-RPC stream.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+        )
+        .with(telemetry.and_then(Telemetry::diagnostics_layer))
+        .init();
+}
+
+async fn run(cli: Cli, telemetry: Option<Telemetry>) -> anyhow::Result<()> {
     let readonly = cli.readonly();
     let transport = cli.transport().context("invalid OPENQA_MCP_TRANSPORT")?;
     if cli.http || cli.stdio {
@@ -104,16 +123,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .transpose()?;
 
     // Config -> sink, before the registry and well before a socket is bound.
-    let audit = build_auditor(cli.audit_config.as_deref())?;
-
-    // Preflight, same as the audit sink above: the startup probe is fatal on
-    // both transports, so it must resolve and complete before anything else
-    // stands up. `None` when no `OTEL_*` variable is set — off means off, no
-    // client, no task, no allocation.
-    let telemetry = Telemetry::init().await?;
+    // Telemetry is already up (resolved and probed in `serve()`, before this
+    // function even started), so the sink can bridge onto the OTLP pipeline
+    // from the moment it opens.
+    let log_producer = telemetry.as_ref().and_then(Telemetry::log_producer);
+    let audit = build_auditor(cli.audit_config.as_deref(), log_producer)?;
 
     let servers =
         build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;
+    let server_ids = servers.identifiers().join(",");
     ruoqa_mcp::heartbeat::interval().context("invalid OPENQA_MCP_HEARTBEAT_INTERVAL")?;
     let call_timeout =
         ruoqa_mcp::config::call_timeout().context("invalid OPENQA_MCP_CALL_TIMEOUT")?;
@@ -121,10 +139,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_call_timeout(call_timeout)
         .with_audit(audit.clone())
         .with_transport(transport);
+    // One event, not five: everything an operator with a default `RUST_LOG`
+    // needs to confirm the process came up the way they configured it.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        transport = ?transport,
+        tool_count = server.tool_count(),
+        servers = %server_ids,
+        audit = audit.is_some(),
+        "ruoqa-mcp starting"
+    );
     let result = match auth {
         Some(auth) => run_http(server, auth, &cli).await,
         None => run_stdio(server).await,
     };
+    tracing::info!(ok = result.is_ok(), "ruoqa-mcp shutting down");
     if result.is_ok()
         && let Some(audit) = &audit
     {
@@ -140,19 +169,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     result
 }
 
-/// Parse `path` (if given) into an [`Auditor`], opening its sink. `None`
-/// disables auditing entirely: no config was requested at all.
-fn build_auditor(path: Option<&std::path::Path>) -> anyhow::Result<Option<Arc<Auditor>>> {
+/// Parse `path` (if given) into an [`Auditor`], opening its sink and
+/// bridging it onto `log_producer` when telemetry is configured. `None`
+/// (for `path`) disables auditing entirely: no config was requested at all.
+fn build_auditor(
+    path: Option<&std::path::Path>,
+    log_producer: Option<ruoqa_mcp::LogProducer>,
+) -> anyhow::Result<Option<Arc<Auditor>>> {
     let Some(path) = path else { return Ok(None) };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read audit config {}", path.display()))?;
     let cfg = AuditConfig::parse(&text)?;
-    let auditor = Auditor::open(&cfg).with_context(|| {
+    let mut auditor = Auditor::open(&cfg).with_context(|| {
         format!(
             "failed to open the audit sink configured in {}",
             path.display()
         )
     })?;
+    if let Some(producer) = log_producer {
+        auditor = auditor.with_otlp(producer);
+    }
     Ok(Some(Arc::new(auditor)))
 }
 
@@ -219,7 +255,8 @@ async fn run_http(server: OpenQaServer, auth: HttpAuth, cli: &Cli) -> anyhow::Re
              every caller gets the full write scope"
         );
     }
-    let server = server.with_scope_enforcement(!auth.is_insecure());
+    let auth_enforced = !auth.is_insecure();
+    let server = server.with_scope_enforcement(auth_enforced);
     let router = router(
         server,
         Arc::new(auth),
@@ -229,6 +266,7 @@ async fn run_http(server: OpenQaServer, auth: HttpAuth, cli: &Cli) -> anyhow::Re
     let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;
+    tracing::info!(host, port, auth_enforced, "listening");
 
     cancel_on_signal(ct.clone());
     axum::serve(listener, router)

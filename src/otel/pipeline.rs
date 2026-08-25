@@ -23,14 +23,10 @@ use super::env::QueueConfig;
 
 /// `tracing` targets excluded from the diagnostics stream: this module and
 /// the HTTP stack beneath it. Without this, a failing export would log,
-/// which (once phase D wires the diagnostics `Layer`) would queue a record,
-/// which would trigger another export — bugwarden hit exactly this loop with
+/// which (once the diagnostics `Layer` is wired) would queue a record, which
+/// would trigger another export — bugwarden hit exactly this loop with
 /// `opentelemetry-appender-tracing`. Every `tracing` call in this module uses
 /// `target: "ruoqa_mcp::otel"` so the exclusion holds by construction.
-#[allow(
-    dead_code,
-    reason = "wired into the diagnostics tracing Layer in phase D"
-)]
 pub(crate) const EXCLUDED_TARGETS: &[&str] = &[
     "ruoqa_mcp::otel",
     "reqwest",
@@ -44,10 +40,6 @@ pub(crate) const EXCLUDED_TARGETS: &[&str] = &[
 /// Whether `target` is inside one of [`EXCLUDED_TARGETS`]: an exact match, or
 /// a child module (`target::` prefix). `"reqwestish"` merely sharing a
 /// prefix with `"reqwest"` must not match.
-#[allow(
-    dead_code,
-    reason = "wired into the diagnostics tracing Layer in phase D"
-)]
 pub(crate) fn excluded(target: &str) -> bool {
     EXCLUDED_TARGETS
         .iter()
@@ -60,10 +52,6 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// Closed-vocabulary reason a record never reached the collector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DropReason {
-    #[allow(
-        dead_code,
-        reason = "only reachable once phase D's tool path calls Exporter::enqueue"
-    )]
     QueueFull,
     Network,
     HttpStatus,
@@ -128,6 +116,51 @@ impl Dropped {
 /// what keeps this module itself signal-generic.
 pub(crate) type EncodeBatch = Arc<dyn Fn(&[Vec<u8>]) -> Vec<u8> + Send + Sync>;
 
+/// The send side of an [`Exporter`]'s queue, cloneable and independent of the
+/// exporter's own lifetime. `Exporter::shutdown` consumes `self`, so it
+/// cannot live behind an `Arc` shared with a `tracing` `Layer` — this is what
+/// the `Layer` holds instead.
+///
+/// Outstanding clones do **not** keep the export task alive: shutdown is
+/// driven by the `Exporter`'s `CancellationToken`, not by every sender
+/// dropping, so a leaked `Producer` clone cannot wedge process exit.
+#[derive(Clone)]
+pub(crate) struct Producer {
+    tx: mpsc::Sender<Vec<u8>>,
+    dropped: Arc<Dropped>,
+}
+
+#[cfg(test)]
+impl Producer {
+    /// Bypasses `Exporter::start`'s task/HTTP machinery entirely, for a
+    /// caller (`audit.rs`'s tests) that only needs to observe what gets
+    /// enqueued.
+    pub(crate) fn for_test(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            dropped: Arc::new(Dropped::default()),
+        }
+    }
+}
+
+impl Producer {
+    /// Enqueues one pre-encoded record. **Never awaits**: callers include the
+    /// tool path and the audit sink's lock holder, and a dead collector must
+    /// never slow either down. A full queue drops the record and accounts it
+    /// under `queue_full`.
+    pub(crate) fn enqueue(&self, encoded_record: Vec<u8>) {
+        match self.tx.try_send(encoded_record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.record(DropReason::QueueFull, 1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped.record(DropReason::Shutdown, 1);
+            }
+        }
+    }
+}
+
 /// One bounded queue and one export task for a single OTLP signal.
 pub(crate) struct Exporter {
     tx: mpsc::Sender<Vec<u8>>,
@@ -181,22 +214,12 @@ impl Exporter {
         }
     }
 
-    /// Enqueues one pre-encoded record. **Never awaits**: the producer is the
-    /// tool path, and a dead collector must never slow it down. A full queue
-    /// drops the record and accounts it under `queue_full`.
-    #[allow(
-        dead_code,
-        reason = "phase D's tracing Layer is the first production caller"
-    )]
-    pub(crate) fn enqueue(&self, encoded_record: Vec<u8>) {
-        match self.tx.try_send(encoded_record) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped.record(DropReason::QueueFull, 1);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.dropped.record(DropReason::Shutdown, 1);
-            }
+    /// A cloneable send handle, independent of `self`'s lifetime. See
+    /// [`Producer`] for why this is a separate type.
+    pub(crate) fn producer(&self) -> Producer {
+        Producer {
+            tx: self.tx.clone(),
+            dropped: Arc::clone(&self.dropped),
         }
     }
 
@@ -420,9 +443,10 @@ mod tests {
 
         // Fill the queue (capacity 1), then a second enqueue must drop
         // rather than block, and return promptly.
-        exporter.enqueue(vec![1]);
+        let producer = exporter.producer();
+        producer.enqueue(vec![1]);
         let start = std::time::Instant::now();
-        exporter.enqueue(vec![2]);
+        producer.enqueue(vec![2]);
         assert!(start.elapsed() < Duration::from_millis(100));
         // Either this enqueue landed in the queue or the task already
         // drained slot 0 into an in-flight export; both are acceptable, but
@@ -433,7 +457,7 @@ mod tests {
     /// A collector that accepts the connection but never answers must still
     /// leave `enqueue` prompt, and the records it cannot make room for are
     /// accounted under `queue_full` — the real point of the drop-accounting
-    /// design (rule 3 in the plan: nothing here may await the network).
+    /// design: nothing here may await the network.
     #[tokio::test]
     async fn hung_collector_drops_queue_full_and_stays_prompt() {
         let collector = wiremock::MockServer::start().await;
@@ -459,9 +483,10 @@ mod tests {
             encode_batch,
         );
 
+        let producer = exporter.producer();
         let start = std::time::Instant::now();
         for i in 0..20u8 {
-            exporter.enqueue(vec![i]);
+            producer.enqueue(vec![i]);
         }
         let elapsed = start.elapsed();
         assert!(
@@ -473,6 +498,75 @@ mod tests {
         // the rest of the queue fills up and drops behind it.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(exporter.dropped(DropReason::QueueFull) > 0);
+
+        exporter.shutdown(Duration::from_millis(50)).await;
+    }
+
+    /// C4's deferred test: a failing export logs (this file's own
+    /// `Dropped::record`), which — without the target exclusion — would
+    /// queue a record via the diagnostics `Layer`, triggering another
+    /// export. Drives real traffic through a real `Layer` against a really
+    /// failing exporter and asserts the drop count is bounded by the
+    /// traffic generated, not compounded by the failures warning about
+    /// themselves.
+    ///
+    /// A collector that always answers 500 (not a closed port): 500 is not
+    /// in `send_with_retry`'s retryable set, so each export fails on its
+    /// first attempt instead of waiting out `RETRY_BACKOFF` three times —
+    /// same failure class (`DropReason::HttpStatus`), a deterministic test.
+    #[tokio::test]
+    async fn diagnostics_layer_does_not_feed_its_own_export_failures_back_in() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const TRAFFIC: u64 = 20;
+
+        let collector = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&collector)
+            .await;
+
+        let queue = QueueConfig {
+            max_queue_size: 64,
+            max_export_batch_size: 4,
+            schedule_delay: Duration::from_millis(10),
+        };
+        let client = reqwest::Client::new();
+        let endpoint = Url::parse(&format!("{}/v1/logs", collector.uri())).unwrap();
+        let encode_batch: EncodeBatch = Arc::new(|records: &[Vec<u8>]| records.concat());
+        let exporter = Exporter::start(
+            client,
+            endpoint,
+            HeaderMap::new(),
+            Duration::from_millis(200),
+            queue,
+            encode_batch,
+        );
+
+        let layer = super::super::logs::DiagnosticsLayer::new(exporter.producer());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Simulated real traffic on a non-excluded target — 20 events, none
+        // of them the pipeline's own `target: "ruoqa_mcp::otel"` warnings.
+        for i in 0..TRAFFIC {
+            tracing::debug!(target: "ruoqa_mcp::server", i, "simulated tool call");
+        }
+
+        // Long enough for several export/fail cycles at a 10ms schedule
+        // delay and a 200ms per-request timeout.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let dropped = exporter.dropped(DropReason::HttpStatus);
+        assert!(
+            dropped > 0,
+            "the mock 500 should have failed at least one export"
+        );
+        assert!(
+            dropped <= TRAFFIC,
+            "drop count ({dropped}) exceeded the traffic generated ({TRAFFIC}): the pipeline's \
+             own drop warnings are feeding back into the export queue"
+        );
 
         exporter.shutdown(Duration::from_millis(50)).await;
     }
