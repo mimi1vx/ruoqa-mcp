@@ -3,6 +3,7 @@
 
 pub(crate) mod env;
 pub(crate) mod logs;
+pub(crate) mod metrics;
 pub(crate) mod pipeline;
 pub(crate) mod proto;
 pub(crate) mod traces;
@@ -19,11 +20,12 @@ use env::{OtelConfig, SignalConfig};
 /// unconditionally, not only on a clean exit.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
-/// Holds one [`pipeline::Exporter`] per configured signal. `metrics` arrives
-/// in phase F; `logs` and `traces` both have a caller here.
+/// Holds one [`pipeline::Exporter`] per configured signal, plus the metrics
+/// signal's own registry and periodic reader.
 pub(crate) struct Telemetry {
     logs: Option<pipeline::Exporter>,
     traces: Option<pipeline::Exporter>,
+    metrics: Option<metrics::MetricsPipeline>,
     sampler: env::Sampler,
 }
 
@@ -72,31 +74,44 @@ impl Telemetry {
             None => None,
         };
 
+        let metrics = match &cfg.metrics {
+            Some(signal) => {
+                probe_metrics(&client, &cfg.service_name, signal)
+                    .await
+                    .context("OTLP startup probe failed")?;
+                let exporter =
+                    start_metrics_exporter(client.clone(), &cfg.service_name, signal, cfg.queue);
+                let registry = Arc::new(metrics::Registry::new(logs::now_unix_nanos()));
+                Some(metrics::MetricsPipeline::start(
+                    registry,
+                    exporter,
+                    cfg.metric_export_interval,
+                ))
+            }
+            None => None,
+        };
+
         Ok(Self {
             logs,
             traces,
+            metrics,
             sampler: cfg.sampler,
         })
     }
 
-    /// Flushes every configured exporter concurrently, each bounded by
+    /// Flushes every configured signal concurrently, each bounded by
     /// [`SHUTDOWN_BUDGET`]: sequential `.await`s would make the budget
     /// `SHUTDOWN_BUDGET` *per signal* on the way out of a stdio session.
     /// Called unconditionally on the way out, including on a failing run:
     /// the stdio path's `process::exit(0)` runs no destructors, so this is
-    /// the only flush that happens.
+    /// the only flush that happens. One `join!` over three `Option`s rather
+    /// than an eight-arm match on all three at once.
     pub(crate) async fn shutdown(self) {
-        match (self.logs, self.traces) {
-            (Some(logs), Some(traces)) => {
-                tokio::join!(
-                    logs.shutdown(SHUTDOWN_BUDGET),
-                    traces.shutdown(SHUTDOWN_BUDGET)
-                );
-            }
-            (Some(logs), None) => logs.shutdown(SHUTDOWN_BUDGET).await,
-            (None, Some(traces)) => traces.shutdown(SHUTDOWN_BUDGET).await,
-            (None, None) => {}
-        }
+        tokio::join!(
+            maybe_shutdown_exporter(self.logs),
+            maybe_shutdown_exporter(self.traces),
+            maybe_shutdown_metrics(self.metrics),
+        );
     }
 
     /// A send handle onto the logs pipeline, for the audit stream to
@@ -112,6 +127,16 @@ impl Telemetry {
         self.traces
             .as_ref()
             .map(|exporter| (exporter.producer(), self.sampler))
+    }
+
+    /// A handle onto the metrics registry, for `OpenQaServer` to record one
+    /// `record_call` per completed tool call. `None` when the metrics signal
+    /// is not configured: no registry exists, so a tool call does no
+    /// encoding, no allocation, and takes no lock.
+    pub(crate) fn metric_recorder(&self) -> Option<Arc<metrics::Registry>> {
+        self.metrics
+            .as_ref()
+            .map(metrics::MetricsPipeline::registry)
     }
 
     /// The diagnostics `tracing` `Layer`, filtered so `RUST_LOG` (defaulting
@@ -151,6 +176,24 @@ impl Telemetry {
             let with_level = Layer::<S>::with_filter(layer, level_filter);
             Layer::<S>::with_filter(with_level, target_filter)
         })
+    }
+}
+
+/// Flushes one logs/traces `Exporter`, if configured. Shared by both call
+/// sites in `Telemetry::shutdown`: `logs` and `traces` are the same
+/// `pipeline::Exporter` type, unlike `metrics`.
+async fn maybe_shutdown_exporter(exporter: Option<pipeline::Exporter>) {
+    if let Some(exporter) = exporter {
+        exporter.shutdown(SHUTDOWN_BUDGET).await;
+    }
+}
+
+/// Flushes the metrics pipeline, if configured — cancels its reader, does
+/// one final collection, then flushes its own `Exporter` (see
+/// [`metrics::MetricsPipeline::shutdown`] for why that ordering matters).
+async fn maybe_shutdown_metrics(metrics: Option<metrics::MetricsPipeline>) {
+    if let Some(metrics) = metrics {
+        metrics.shutdown(SHUTDOWN_BUDGET).await;
     }
 }
 
@@ -291,6 +334,60 @@ async fn probe_traces(
         .collect();
     let (scope_name, scope_version) = scope();
     let body = traces::encode_request(&resource_refs, (&scope_name, &scope_version), &[span]);
+
+    pipeline::send_with_retry(
+        client,
+        &signal.endpoint,
+        &signal.headers.to_header_map(),
+        signal.timeout,
+        body,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn start_metrics_exporter(
+    client: reqwest::Client,
+    service_name: &str,
+    signal: &SignalConfig,
+    queue: env::QueueConfig,
+) -> pipeline::Exporter {
+    let resource = resource_attrs(service_name);
+    let scope = scope();
+    let encode_batch: pipeline::EncodeBatch = Arc::new(move |bodies: &[Vec<u8>]| {
+        let resource_refs: Vec<(&str, proto::Value<'_>)> = resource
+            .iter()
+            .map(|(k, v)| (k.as_str(), proto::Value::Str(v.as_str())))
+            .collect();
+        metrics::encode_request(&resource_refs, (scope.0.as_str(), scope.1.as_str()), bodies)
+    });
+    pipeline::Exporter::start(
+        client,
+        signal.endpoint.clone(),
+        signal.headers.to_header_map(),
+        signal.timeout,
+        queue,
+        encode_batch,
+    )
+}
+
+/// Posts one `ruoqa.startup` `Metric` (see
+/// [`metrics::encode_startup_metric`]). Proves the collector accepts a real
+/// `Metric` (not just an empty request), the same argument [`probe_logs`]
+/// and [`probe_traces`] make for their own signals.
+async fn probe_metrics(
+    client: &reqwest::Client,
+    service_name: &str,
+    signal: &SignalConfig,
+) -> anyhow::Result<()> {
+    let metric = metrics::encode_startup_metric(logs::now_unix_nanos());
+    let resource = resource_attrs(service_name);
+    let resource_refs: Vec<(&str, proto::Value<'_>)> = resource
+        .iter()
+        .map(|(k, v)| (k.as_str(), proto::Value::Str(v.as_str())))
+        .collect();
+    let (scope_name, scope_version) = scope();
+    let body = metrics::encode_request(&resource_refs, (&scope_name, &scope_version), &[metric]);
 
     pipeline::send_with_retry(
         client,

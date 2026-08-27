@@ -136,6 +136,36 @@ impl Message {
             _ => None,
         }
     }
+
+    /// `field`'s value as `f64`, reinterpreting a `Fixed64`'s bits — the
+    /// wire shape `double` and `sfixed64`/`fixed64` share, so the decoder
+    /// cannot tell them apart on its own.
+    pub fn f64(&self, field: u32) -> Option<f64> {
+        match self.get(field) {
+            Some(Field::Fixed64(bits)) => Some(f64::from_bits(*bits)),
+            _ => None,
+        }
+    }
+
+    /// `field`'s `Len` payload as packed `fixed64` values (e.g.
+    /// `HistogramDataPoint.bucket_counts`).
+    pub fn packed_u64(&self, field: u32) -> Option<Vec<u64>> {
+        match self.get(field) {
+            Some(Field::Len(bytes)) => {
+                let (chunks, rest) = bytes.as_chunks::<8>();
+                rest.is_empty()
+                    .then(|| chunks.iter().copied().map(u64::from_le_bytes).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// `field`'s `Len` payload as packed `double` values (e.g.
+    /// `HistogramDataPoint.explicit_bounds`).
+    pub fn packed_f64(&self, field: u32) -> Option<Vec<f64>> {
+        self.packed_u64(field)
+            .map(|values| values.into_iter().map(f64::from_bits).collect())
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +239,31 @@ mod tests {
         let (chunks, _) = packed.as_chunks::<8>();
         let values: Vec<u64> = chunks.iter().copied().map(u64::from_le_bytes).collect();
         assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn f64_reinterprets_a_fixed64_fields_bits() {
+        let mut bytes = vec![0x09]; // tag(field=1, FIXED64)
+        bytes.extend_from_slice(&1.5f64.to_bits().to_le_bytes());
+        let msg = Message::parse(&bytes).unwrap();
+        assert_eq!(msg.f64(1), Some(1.5));
+    }
+
+    #[test]
+    fn packed_u64_and_packed_f64_round_trip() {
+        let mut bytes = vec![0x1a, 0x18]; // tag(field=3, LEN), length=24
+        for v in [1u64, 2, 3] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let msg = Message::parse(&bytes).unwrap();
+        assert_eq!(msg.packed_u64(3), Some(vec![1, 2, 3]));
+
+        let mut bytes = vec![0x1a, 0x10]; // tag(field=3, LEN), length=16
+        for v in [1.5f64, 2.5] {
+            bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        let msg = Message::parse(&bytes).unwrap();
+        assert_eq!(msg.packed_f64(3), Some(vec![1.5, 2.5]));
     }
 
     #[test]

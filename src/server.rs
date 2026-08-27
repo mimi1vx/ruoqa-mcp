@@ -15,7 +15,6 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
-use crate::TraceProducer;
 use crate::audit::{self, Auditor, Outcome, RecordScope, Transport};
 use crate::error::{classify, kind_of, tool_error};
 use crate::form::Form;
@@ -23,6 +22,7 @@ use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
 use crate::otel::{self, traces::SpanCtx};
 use crate::servers::ServerRegistry;
+use crate::{MetricRecorder, TraceProducer};
 
 tokio::task_local! {
     /// The current tool call's span context. Set once per `call_tool`, read
@@ -99,15 +99,10 @@ fn emit_tool_span(
     error_kind: Option<&str>,
     start_wall_nanos: u64,
 ) {
-    let outcome_str = match outcome {
-        Outcome::Ok => "ok",
-        Outcome::ToolError { .. } => "tool_error",
-        Outcome::ProtocolError { .. } => "protocol_error",
-    };
     let mut attrs: Vec<(&str, otel::proto::Value<'_>)> = vec![
         ("tool", otel::proto::Value::Str(tool)),
         ("scope", otel::proto::Value::Str(scope_str(scope))),
-        ("outcome", otel::proto::Value::Str(outcome_str)),
+        ("outcome", otel::proto::Value::Str(outcome_str(outcome))),
     ];
     if let Some(server) = server {
         attrs.push(("server", otel::proto::Value::Str(server)));
@@ -134,6 +129,18 @@ fn scope_str(scope: RecordScope) -> &'static str {
         RecordScope::Read => "read",
         RecordScope::Write => "write",
         RecordScope::None => "none",
+    }
+}
+
+/// Shared by the tool span's `outcome` attribute and the metrics registry's
+/// `CallKey`: both need the same closed-vocabulary `&'static str`, and a
+/// metric that disagreed with the span about a call's outcome would be
+/// worse than no metric.
+fn outcome_str(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Ok => "ok",
+        Outcome::ToolError { .. } => "tool_error",
+        Outcome::ProtocolError { .. } => "protocol_error",
     }
 }
 
@@ -168,6 +175,9 @@ pub struct OpenQaServer {
     /// The traces stream. `None` means traces are off: `call_tool` does no
     /// encoding, no allocation, and never enters [`CURRENT_SPAN`]'s scope.
     traces: Option<TraceProducer>,
+    /// The metrics registry. `None` means metrics are off: `call_tool` takes
+    /// no lock and allocates nothing.
+    metrics: Option<MetricRecorder>,
 }
 
 impl OpenQaServer {
@@ -199,6 +209,7 @@ impl OpenQaServer {
             audit: None,
             transport: Transport::Stdio,
             traces: None,
+            metrics: None,
         }
     }
 
@@ -236,6 +247,13 @@ impl OpenQaServer {
     #[must_use]
     pub fn with_traces(mut self, traces: Option<TraceProducer>) -> Self {
         self.traces = traces;
+        self
+    }
+
+    /// Set the metrics registry; `None` (the default) disables it entirely.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<MetricRecorder>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -584,6 +602,16 @@ impl ServerHandler for OpenQaServer {
             "error.kind" = error_kind,
             "tool call"
         );
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_call(
+                &tool,
+                server.as_deref(),
+                outcome_str(&outcome),
+                error_kind,
+                duration_ms,
+            );
+        }
 
         let trace_ids = span
             .as_ref()

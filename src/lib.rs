@@ -75,6 +75,16 @@ impl Telemetry {
             .map(|(producer, sampler)| TraceProducer { producer, sampler })
     }
 
+    /// A handle onto the metrics registry, for
+    /// [`server::OpenQaServer::with_metrics`] to record one `record_call`
+    /// per completed tool call. `None` when the metrics signal is not
+    /// configured: no registry exists, so a tool call does no encoding, no
+    /// allocation, and takes no lock.
+    #[must_use]
+    pub fn metric_recorder(&self) -> Option<MetricRecorder> {
+        self.0.metric_recorder().map(MetricRecorder)
+    }
+
     /// The diagnostics `tracing` `Layer`: one `LogRecord` per non-excluded
     /// event, filtered by `RUST_LOG` (default INFO) and the pipeline's own
     /// target exclusion. `None` when the logs signal is not configured —
@@ -119,5 +129,25 @@ impl TraceProducer {
 
     pub(crate) fn sampler(&self) -> otel::env::Sampler {
         self.sampler
+    }
+}
+
+/// Opaque handle onto the metrics registry, for a tool call to record its
+/// outcome and duration. `Clone`, like `LogProducer`/`TraceProducer`: cheap
+/// (one `Arc` bump), and every completed tool call needs its own.
+#[derive(Clone)]
+pub struct MetricRecorder(std::sync::Arc<otel::metrics::Registry>);
+
+impl MetricRecorder {
+    pub(crate) fn record_call(
+        &self,
+        tool: &str,
+        server: Option<&str>,
+        outcome: &'static str,
+        error_kind: Option<&str>,
+        duration_ms: u64,
+    ) {
+        self.0
+            .record_call(tool, server, outcome, error_kind, duration_ms);
     }
 }

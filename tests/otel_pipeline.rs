@@ -36,7 +36,8 @@ async fn startup_probe_success_and_fatal_failure() {
     // unasserted probe against the same collector.
     unsafe {
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
-        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
+        std::env::set_var("OTEL_TRACES_EXPORTER", "none");
+        std::env::set_var("OTEL_METRICS_EXPORTER", "none");
     }
 
     let telemetry = Telemetry::init()
@@ -97,7 +98,8 @@ async fn startup_probe_success_and_fatal_failure() {
 
     unsafe {
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
+        std::env::remove_var("OTEL_TRACES_EXPORTER");
+        std::env::remove_var("OTEL_METRICS_EXPORTER");
     }
 }
 

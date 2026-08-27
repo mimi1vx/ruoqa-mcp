@@ -29,6 +29,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_QUEUE_SIZE: usize = 2048;
 const DEFAULT_MAX_EXPORT_BATCH_SIZE: usize = 512;
 const DEFAULT_SCHEDULE_DELAY_MS: u64 = 5000;
+const DEFAULT_METRIC_EXPORT_INTERVAL_MS: u64 = 60_000;
 
 /// A `get`-style lookup, as `std::env::var(name).ok()` would produce.
 type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -136,10 +137,13 @@ pub(crate) struct OtelConfig {
     pub(crate) service_name: String,
     pub(crate) logs: Option<SignalConfig>,
     pub(crate) traces: Option<SignalConfig>,
-    #[allow(dead_code, reason = "the metrics signal has no caller before phase F")]
     pub(crate) metrics: Option<SignalConfig>,
     pub(crate) queue: QueueConfig,
     pub(crate) sampler: Sampler,
+    /// `OTEL_METRIC_EXPORT_INTERVAL`, resolved unconditionally like
+    /// `sampler` — a typo here is a startup error whether or not the
+    /// metrics signal ends up configured.
+    pub(crate) metric_export_interval: Duration,
 }
 
 /// `OTEL_TRACES_SAMPLER`. Ratio samplers are out of scope; these two cover
@@ -173,6 +177,9 @@ pub(crate) enum EnvError {
         value: String,
     },
     UnsupportedSampler {
+        value: String,
+    },
+    UnsupportedTemporality {
         value: String,
     },
     UnsupportedTlsOption {
@@ -220,6 +227,11 @@ impl fmt::Display for EnvError {
                 f,
                 "OTEL_TRACES_SAMPLER is set to {value:?}, but only \"always_on\" and \
                  \"parentbased_always_on\" are supported"
+            ),
+            EnvError::UnsupportedTemporality { value } => write!(
+                f,
+                "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE is set to {value:?}, but \
+                 only \"cumulative\" is supported"
             ),
             EnvError::UnsupportedTlsOption { var } => {
                 write!(f, "{var} is set, but custom TLS material is not supported")
@@ -358,11 +370,15 @@ fn resolve_timeout(get: Lookup<'_>, signal: Signal) -> Result<Duration, EnvError
     )?))
 }
 
-/// `OTEL_EXPORTER_OTLP_<SIGNAL>_EXPORTER`: `otlp` (default) or `none`. `none`
-/// is the per-signal off switch, checked before any endpoint work — an
-/// explicit opt-out costs no URL parse and no probe.
+/// `OTEL_<SIGNAL>_EXPORTER`: `otlp` (default) or `none`. `none` is the
+/// per-signal off switch, checked before any endpoint work — an explicit
+/// opt-out costs no URL parse and no probe. Spec-conformant naming: unlike
+/// every other knob this module reads, the exporter switch has no
+/// `EXPORTER_OTLP` infix (`OTEL_LOGS_EXPORTER`, not
+/// `OTEL_EXPORTER_OTLP_LOGS_EXPORTER`), so it is built directly rather than
+/// through [`var_name`].
 fn resolve_exporter(get: Lookup<'_>, signal: Signal) -> Result<bool, EnvError> {
-    let var = var_name(Some(signal), "_EXPORTER");
+    let var = format!("OTEL{}_EXPORTER", signal.env_infix());
     match lookup(get, &var).as_deref() {
         None | Some("otlp") => Ok(true),
         Some("none") => Ok(false),
@@ -438,6 +454,37 @@ fn resolve_sampler(get: Lookup<'_>) -> Result<Sampler, EnvError> {
     }
 }
 
+/// `OTEL_METRIC_EXPORT_INTERVAL`, milliseconds, default 60000. Validated
+/// unconditionally, like `sampler`. Rejects non-numeric values (via
+/// `parse_millis`) and zero: a zero interval is not "export immediately",
+/// it is a busy-loop.
+fn resolve_metric_export_interval(get: Lookup<'_>) -> Result<Duration, EnvError> {
+    const VAR: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+    let ms = parse_millis(get, VAR, DEFAULT_METRIC_EXPORT_INTERVAL_MS)?;
+    if ms == 0 {
+        return Err(EnvError::InvalidNumber {
+            var: VAR.to_string(),
+            value: "0".to_string(),
+        });
+    }
+    Ok(Duration::from_millis(ms))
+}
+
+/// `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`: `cumulative` only.
+/// `delta` and `lowmemory` are startup errors, not a silent fallback to
+/// cumulative — this crate refuses to export differently than the operator
+/// asked, the same stance `_PROTOCOL`/`_COMPRESSION`/`_EXPORTER` and
+/// `OTEL_TRACES_SAMPLER` already take.
+fn resolve_temporality_preference(get: Lookup<'_>) -> Result<(), EnvError> {
+    let var = var_name(Some(Signal::Metrics), "_TEMPORALITY_PREFERENCE");
+    match lookup(get, &var).as_deref() {
+        None | Some("cumulative") => Ok(()),
+        Some(other) => Err(EnvError::UnsupportedTemporality {
+            value: other.to_string(),
+        }),
+    }
+}
+
 /// Resolves the full `OTEL_*` configuration from a lookup closure. `Ok(None)`
 /// when no signal is configured (or `OTEL_SDK_DISABLED=true`) — the off
 /// switch is either state, and the caller must build nothing at all.
@@ -450,6 +497,8 @@ pub(crate) fn resolve(get: Lookup<'_>) -> Result<Option<OtelConfig>, EnvError> {
     validate_compression(get, None)?;
     validate_no_tls_material(get, None)?;
     let sampler = resolve_sampler(get)?;
+    let metric_export_interval = resolve_metric_export_interval(get)?;
+    resolve_temporality_preference(get)?;
 
     let base_endpoint = lookup(get, "OTEL_EXPORTER_OTLP_ENDPOINT");
     let logs = resolve_signal(get, Signal::Logs, base_endpoint.as_deref())?;
@@ -471,6 +520,7 @@ pub(crate) fn resolve(get: Lookup<'_>) -> Result<Option<OtelConfig>, EnvError> {
         metrics,
         queue,
         sampler,
+        metric_export_interval,
     }))
 }
 
@@ -749,7 +799,7 @@ mod tests {
         for value in [None, Some("otlp")] {
             let mut vars = HashMap::from([("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318")]);
             if let Some(v) = value {
-                vars.insert("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", v);
+                vars.insert("OTEL_TRACES_EXPORTER", v);
             }
             let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
             assert!(cfg.traces.is_some(), "{value:?}");
@@ -760,7 +810,7 @@ mod tests {
     fn exporter_none_disables_only_that_signal() {
         let vars = HashMap::from([
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
-            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none"),
+            ("OTEL_TRACES_EXPORTER", "none"),
         ]);
         let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
         assert!(cfg.traces.is_none());
@@ -771,7 +821,7 @@ mod tests {
     fn exporter_none_costs_no_url_parse_even_with_a_bad_signal_endpoint() {
         let vars = HashMap::from([
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
-            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none"),
+            ("OTEL_TRACES_EXPORTER", "none"),
             ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "not a url"),
         ]);
         assert!(resolve(&lookup_from(&vars)).unwrap().is_some());
@@ -781,12 +831,30 @@ mod tests {
     fn exporter_invalid_value_is_an_error() {
         let vars = HashMap::from([
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
-            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "grpc"),
+            ("OTEL_TRACES_EXPORTER", "grpc"),
         ]);
         assert!(matches!(
             resolve(&lookup_from(&vars)).unwrap_err(),
             EnvError::UnsupportedExporter { .. }
         ));
+    }
+
+    /// The spec's `OTEL_TRACES_EXPORTER` is the only name this crate reads;
+    /// the deviation this module used to ship
+    /// (`OTEL_EXPORTER_OTLP_TRACES_EXPORTER`) is now simply an unknown
+    /// variable, same as any other `OTEL_*` this crate does not read — not
+    /// silently honoured, not an error.
+    #[test]
+    fn old_exporter_otlp_infix_spelling_is_now_unknown_and_ignored() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none"),
+        ]);
+        let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+        assert!(
+            cfg.traces.is_some(),
+            "the old spelling must not disable traces"
+        );
     }
 
     #[test]
@@ -823,6 +891,89 @@ mod tests {
         assert!(matches!(
             resolve(&lookup_from(&vars)).unwrap_err(),
             EnvError::UnsupportedSampler { .. }
+        ));
+    }
+
+    #[test]
+    fn metric_export_interval_default_and_override() {
+        let vars = HashMap::from([("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318")]);
+        let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+        assert_eq!(cfg.metric_export_interval, Duration::from_millis(60_000));
+
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_METRIC_EXPORT_INTERVAL", "1000"),
+        ]);
+        let cfg = resolve(&lookup_from(&vars)).unwrap().unwrap();
+        assert_eq!(cfg.metric_export_interval, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn metric_export_interval_zero_is_an_error() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_METRIC_EXPORT_INTERVAL", "0"),
+        ]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::InvalidNumber { .. }
+        ));
+    }
+
+    #[test]
+    fn metric_export_interval_non_numeric_is_an_error() {
+        let vars = HashMap::from([
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+            ("OTEL_METRIC_EXPORT_INTERVAL", "soon"),
+        ]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::InvalidNumber { .. }
+        ));
+    }
+
+    #[test]
+    fn metric_export_interval_is_validated_even_with_no_signal_configured() {
+        let vars = HashMap::from([("OTEL_METRIC_EXPORT_INTERVAL", "0")]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::InvalidNumber { .. }
+        ));
+    }
+
+    #[test]
+    fn temporality_preference_default_and_cumulative_are_accepted() {
+        for value in [None, Some("cumulative")] {
+            let mut vars = HashMap::from([("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318")]);
+            if let Some(v) = value {
+                vars.insert("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", v);
+            }
+            assert!(resolve(&lookup_from(&vars)).unwrap().is_some(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn temporality_preference_delta_and_lowmemory_are_errors() {
+        for value in ["delta", "lowmemory"] {
+            let vars = HashMap::from([
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://host:4318"),
+                ("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", value),
+            ]);
+            let err = resolve(&lookup_from(&vars)).unwrap_err();
+            assert!(
+                matches!(err, EnvError::UnsupportedTemporality { .. }),
+                "{value}"
+            );
+            assert!(err.to_string().contains("TEMPORALITY_PREFERENCE"));
+        }
+    }
+
+    #[test]
+    fn temporality_preference_is_validated_even_with_no_signal_configured() {
+        let vars = HashMap::from([("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "delta")]);
+        assert!(matches!(
+            resolve(&lookup_from(&vars)).unwrap_err(),
+            EnvError::UnsupportedTemporality { .. }
         ));
     }
 }

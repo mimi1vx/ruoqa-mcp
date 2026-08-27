@@ -538,7 +538,7 @@ async fn traceparent_matches_byte_for_byte_on_span_and_audit_record() {
     unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
 }
 
-/// `OTEL_EXPORTER_OTLP_TRACES_EXPORTER=none` with a base endpoint set
+/// `OTEL_TRACES_EXPORTER=none` with a base endpoint set
 /// produces zero requests to `/v1/traces` (including the startup probe),
 /// while the logs signal keeps working.
 #[allow(
@@ -554,7 +554,7 @@ async fn traces_exporter_none_leaves_logs_working() {
 
     unsafe {
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", collector.uri());
-        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER", "none");
+        std::env::set_var("OTEL_TRACES_EXPORTER", "none");
     }
 
     let telemetry = Telemetry::init()
@@ -571,7 +571,7 @@ async fn traces_exporter_none_leaves_logs_working() {
 
     unsafe {
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_EXPORTER");
+        std::env::remove_var("OTEL_TRACES_EXPORTER");
     }
 }
 

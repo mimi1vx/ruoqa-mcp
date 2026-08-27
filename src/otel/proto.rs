@@ -25,7 +25,7 @@ fn write_tag(buf: &mut Vec<u8>, field: u32, wire: u32) {
     write_varint(buf, u64::from((field << 3) | wire));
 }
 
-fn write_bool(buf: &mut Vec<u8>, field: u32, v: bool) {
+pub(super) fn write_bool(buf: &mut Vec<u8>, field: u32, v: bool) {
     if v {
         write_tag(buf, field, WIRE_VARINT);
         write_varint(buf, 1);
@@ -70,6 +70,23 @@ fn write_double(buf: &mut Vec<u8>, field: u32, v: f64) {
     }
 }
 
+/// `sfixed64`, unconditionally. `NumberDataPoint.as_int` sits behind a
+/// `oneof`, where proto3's normal zero-omission is wrong: a counter whose
+/// value is legitimately 0 must still set the oneof, or the point has no
+/// recognized `value` at all and a collector may treat it as invalid.
+pub(super) fn write_sfixed64_always(buf: &mut Vec<u8>, field: u32, v: i64) {
+    write_tag(buf, field, WIRE_FIXED64);
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// `double`, unconditionally. `HistogramDataPoint.sum` has explicit
+/// presence: omitting it at 0.0 claims "no sum was computed", a different
+/// fact from "the sum is zero".
+pub(super) fn write_double_always(buf: &mut Vec<u8>, field: u32, v: f64) {
+    write_tag(buf, field, WIRE_FIXED64);
+    buf.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
 pub(super) fn write_string(buf: &mut Vec<u8>, field: u32, v: &str) {
     if !v.is_empty() {
         write_bytes(buf, field, v.as_bytes());
@@ -84,11 +101,7 @@ pub(super) fn write_bytes(buf: &mut Vec<u8>, field: u32, v: &[u8]) {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Histogram bucket counts have no caller before phase F"
-)]
-fn write_packed_fixed64(buf: &mut Vec<u8>, field: u32, values: &[u64]) {
+pub(super) fn write_packed_fixed64(buf: &mut Vec<u8>, field: u32, values: &[u64]) {
     if values.is_empty() {
         return;
     }
@@ -99,11 +112,7 @@ fn write_packed_fixed64(buf: &mut Vec<u8>, field: u32, values: &[u64]) {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Histogram explicit bounds have no caller before phase F"
-)]
-fn write_packed_double(buf: &mut Vec<u8>, field: u32, values: &[f64]) {
+pub(super) fn write_packed_double(buf: &mut Vec<u8>, field: u32, values: &[f64]) {
     if values.is_empty() {
         return;
     }
@@ -257,6 +266,24 @@ mod tests {
     }
 
     #[test]
+    fn packed_double_two_values() {
+        let mut buf = Vec::new();
+        write_packed_double(&mut buf, 7, &[1.5, 2.5]);
+        let mut expected = vec![0x3a, 0x10]; // tag(field=7, LEN), length=16
+        for v in [1.5f64, 2.5] {
+            expected.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn packed_double_empty_writes_nothing() {
+        let mut buf = Vec::new();
+        write_packed_double(&mut buf, 7, &[]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn fixed32_golden() {
         let mut buf = Vec::new();
         write_fixed32(&mut buf, 1, 0x0102_0304);
@@ -280,6 +307,40 @@ mod tests {
         let mut expected = vec![0x09];
         expected.extend_from_slice(&1.5f64.to_bits().to_le_bytes());
         assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn sfixed64_always_writes_zero_where_fixed64_would_omit_it() {
+        let mut always = Vec::new();
+        write_sfixed64_always(&mut always, 6, 0);
+        let mut expected = vec![0x31]; // tag(field=6, FIXED64)
+        expected.extend_from_slice(&0i64.to_le_bytes());
+        assert_eq!(always, expected);
+
+        let mut omitted = Vec::new();
+        write_fixed64(&mut omitted, 6, 0);
+        assert!(omitted.is_empty(), "write_fixed64 omits a zero value");
+    }
+
+    #[test]
+    fn sfixed64_always_negative_round_trips_as_two_complement_bytes() {
+        let mut buf = Vec::new();
+        write_sfixed64_always(&mut buf, 1, -1);
+        assert_eq!(buf[0], 0x09); // tag(field=1, FIXED64)
+        assert_eq!(&buf[1..], &(-1i64).to_le_bytes());
+    }
+
+    #[test]
+    fn double_always_writes_zero_where_write_double_would_omit_it() {
+        let mut always = Vec::new();
+        write_double_always(&mut always, 5, 0.0);
+        let mut expected = vec![0x29]; // tag(field=5, FIXED64)
+        expected.extend_from_slice(&0.0f64.to_bits().to_le_bytes());
+        assert_eq!(always, expected);
+
+        let mut omitted = Vec::new();
+        write_double(&mut omitted, 5, 0.0);
+        assert!(omitted.is_empty(), "write_double omits a zero value");
     }
 
     #[test]
