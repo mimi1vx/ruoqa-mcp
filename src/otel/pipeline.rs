@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
@@ -116,6 +116,45 @@ impl Dropped {
 /// what keeps this module itself signal-generic.
 pub(crate) type EncodeBatch = Arc<dyn Fn(&[Vec<u8>]) -> Vec<u8> + Send + Sync>;
 
+/// Whether a signal's export task is currently getting batches to the
+/// collector. Read by the audit fail-closed gate; the logs/traces/metrics
+/// exporters build one too (every `Exporter` does) but nothing reads theirs.
+/// Starts `delivering = true`: the startup probe already proved the
+/// collector reachable, so a signal begins healthy, not suspect.
+pub(crate) struct Health {
+    delivering: AtomicBool,
+    consecutive_failures: AtomicU64,
+}
+
+impl Health {
+    fn new() -> Self {
+        Self {
+            delivering: AtomicBool::new(true),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// One relaxed load, no lock: the gate's fast path.
+    pub(crate) fn is_delivering(&self) -> bool {
+        self.delivering.load(Ordering::Relaxed)
+    }
+
+    fn ok(&self) {
+        self.delivering.store(true, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn fail(&self) {
+        self.delivering.store(false, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+}
+
 /// The send side of an [`Exporter`]'s queue, cloneable and independent of the
 /// exporter's own lifetime. `Exporter::shutdown` consumes `self`, so it
 /// cannot live behind an `Arc` shared with a `tracing` `Layer` — this is what
@@ -166,6 +205,7 @@ pub(crate) struct Exporter {
     tx: mpsc::Sender<Vec<u8>>,
     max_queue_size: usize,
     dropped: Arc<Dropped>,
+    health: Arc<Health>,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -192,6 +232,7 @@ impl Exporter {
     ) -> Self {
         let (tx, rx) = mpsc::channel(queue.max_queue_size);
         let dropped = Arc::new(Dropped::default());
+        let health = Arc::new(Health::new());
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_task(
             rx,
@@ -204,11 +245,13 @@ impl Exporter {
             queue.max_export_batch_size,
             encode_batch,
             Arc::clone(&dropped),
+            Arc::clone(&health),
         ));
         Self {
             tx,
             max_queue_size: queue.max_queue_size,
             dropped,
+            health,
             cancel,
             task,
         }
@@ -228,6 +271,12 @@ impl Exporter {
         self.dropped.get(reason)
     }
 
+    /// A cloneable handle onto this signal's delivery health. Every
+    /// `Exporter` builds one; only the audit stream's gate reads it.
+    pub(crate) fn health(&self) -> Arc<Health> {
+        Arc::clone(&self.health)
+    }
+
     /// Consumes the exporter: signals the task to stop waiting on its
     /// schedule delay, drain whatever is queued, and export it once more —
     /// bounded by `budget`. Cooperative cancellation, not `abort()`: if the
@@ -239,6 +288,7 @@ impl Exporter {
             tx,
             max_queue_size,
             dropped,
+            health: _,
             cancel,
             task,
         } = self;
@@ -265,6 +315,7 @@ async fn run_task(
     max_export_batch_size: usize,
     encode_batch: EncodeBatch,
     dropped: Arc<Dropped>,
+    health: Arc<Health>,
 ) {
     let mut batch: Vec<Vec<u8>> = Vec::new();
     loop {
@@ -274,14 +325,14 @@ async fn run_task(
             biased;
             () = cancel.cancelled() => break,
             () = &mut sleep, if !batch.is_empty() => {
-                export(&client, &endpoint, &headers, timeout, &encode_batch, &mut batch, &dropped).await;
+                export(&client, &endpoint, &headers, timeout, &encode_batch, &mut batch, &dropped, &health).await;
             }
             received = rx.recv() => {
                 match received {
                     Some(record) => {
                         batch.push(record);
                         if batch.len() >= max_export_batch_size {
-                            export(&client, &endpoint, &headers, timeout, &encode_batch, &mut batch, &dropped).await;
+                            export(&client, &endpoint, &headers, timeout, &encode_batch, &mut batch, &dropped, &health).await;
                         }
                     }
                     None => break,
@@ -303,11 +354,16 @@ async fn run_task(
             &encode_batch,
             &mut batch,
             &dropped,
+            &health,
         )
         .await;
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal task helper, not a public API"
+)]
 async fn export(
     client: &reqwest::Client,
     endpoint: &Url,
@@ -316,19 +372,24 @@ async fn export(
     encode_batch: &EncodeBatch,
     batch: &mut Vec<Vec<u8>>,
     dropped: &Dropped,
+    health: &Health,
 ) {
     let records = std::mem::take(batch);
     let count = records.len() as u64;
     let body = encode_batch(&records);
 
-    if let Err(e) = send_with_retry(client, endpoint, headers, timeout, body).await {
-        // The response body/error is deliberately not logged: an endpoint
-        // may carry credentials in its userinfo.
-        let reason = match e {
-            SendError::Network => DropReason::Network,
-            SendError::HttpStatus(_) => DropReason::HttpStatus,
-        };
-        dropped.record(reason, count);
+    match send_with_retry(client, endpoint, headers, timeout, body).await {
+        Ok(()) => health.ok(),
+        Err(e) => {
+            // The response body/error is deliberately not logged: an
+            // endpoint may carry credentials in its userinfo.
+            let reason = match e {
+                SendError::Network => DropReason::Network,
+                SendError::HttpStatus(_) => DropReason::HttpStatus,
+            };
+            dropped.record(reason, count);
+            health.fail();
+        }
     }
 }
 
@@ -567,6 +628,61 @@ mod tests {
             "drop count ({dropped}) exceeded the traffic generated ({TRAFFIC}): the pipeline's \
              own drop warnings are feeding back into the export queue"
         );
+
+        exporter.shutdown(Duration::from_millis(50)).await;
+    }
+
+    /// The gate's precondition: `Health` starts delivering, goes false on a
+    /// failed export and true again once the collector recovers. A reversed
+    /// polarity (starts `false`, or `ok()` on failure) would refuse every
+    /// call the instant a collector is configured — this is the test that
+    /// would catch it.
+    #[tokio::test]
+    async fn health_reflects_export_failure_then_recovery() {
+        let collector = wiremock::MockServer::start().await;
+        // 500 is not in `send_with_retry`'s retryable set, so this fails on
+        // the first attempt rather than waiting out `RETRY_BACKOFF` retries.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&collector)
+            .await;
+
+        let queue = QueueConfig {
+            max_queue_size: 8,
+            max_export_batch_size: 1,
+            schedule_delay: Duration::from_millis(10),
+        };
+        let client = reqwest::Client::new();
+        let endpoint = Url::parse(&format!("{}/v1/logs", collector.uri())).unwrap();
+        let encode_batch: EncodeBatch = Arc::new(|records: &[Vec<u8>]| records.concat());
+        let exporter = Exporter::start(
+            client,
+            endpoint,
+            HeaderMap::new(),
+            Duration::from_millis(200),
+            queue,
+            encode_batch,
+        );
+        let health = exporter.health();
+        assert!(health.is_delivering(), "starts true");
+
+        exporter.producer().enqueue(vec![1]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!health.is_delivering(), "a failed export must clear it");
+        assert!(health.consecutive_failures() >= 1);
+
+        // Swap in a collector that always accepts, then prove one success
+        // sets `delivering` back to true and resets the failure streak.
+        collector.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+
+        exporter.producer().enqueue(vec![2]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(health.is_delivering(), "a subsequent success must set it");
+        assert_eq!(health.consecutive_failures(), 0);
 
         exporter.shutdown(Duration::from_millis(50)).await;
     }

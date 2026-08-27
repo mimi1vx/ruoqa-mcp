@@ -16,7 +16,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 use serde_json::{Value, json};
 
 use crate::audit::{self, Auditor, Outcome, RecordScope, Transport};
-use crate::error::{classify, kind_of, tool_error};
+use crate::error::{audit_unavailable, classify, kind_of, tool_error};
 use crate::form::Form;
 use crate::heartbeat::with_heartbeat;
 use crate::http::{Scope, scope_of};
@@ -305,6 +305,22 @@ impl OpenQaServer {
         }
     }
 
+    /// The fail-closed gate: whether `call_tool` should refuse a call of
+    /// this `scope` instead of dispatching it. Computed before the span is
+    /// started, so a refusal still gets the same post-dispatch tail (span,
+    /// metric, audit record) as any other call, from one classification.
+    /// Never consulted when auditing is off, and never gates `initialize`
+    /// or `list_tools` — only this, the one place a tool actually runs.
+    fn gate(&self, scope: RecordScope) -> bool {
+        self.audit.as_ref().is_some_and(|audit| {
+            let refused = audit.refuses(scope);
+            if refused {
+                audit.refused();
+            }
+            refused
+        })
+    }
+
     /// GET (or other body-less request) under a heartbeat.
     pub(crate) async fn request_json(
         &self,
@@ -548,6 +564,7 @@ impl ServerHandler for OpenQaServer {
         let start_wall_nanos = otel::logs::now_unix_nanos();
         let tool = request.name.to_string();
         let scope = self.record_scope(&tool);
+        let refused = self.gate(scope);
         let server_selector = request
             .arguments
             .as_ref()
@@ -571,17 +588,21 @@ impl ServerHandler for OpenQaServer {
                 .map(|(ctx, parent)| (ctx, parent, traces.clone()))
         });
 
-        let result = match &span {
-            Some((ctx, _, traces)) => {
-                CURRENT_SPAN
-                    .scope(
-                        Some(*ctx),
-                        CURRENT_TRACE_PRODUCER
-                            .scope(Some(traces.clone()), self.dispatch(request, context)),
-                    )
-                    .await
+        let result = if refused {
+            Ok(audit_unavailable()?.into())
+        } else {
+            match &span {
+                Some((ctx, _, traces)) => {
+                    CURRENT_SPAN
+                        .scope(
+                            Some(*ctx),
+                            CURRENT_TRACE_PRODUCER
+                                .scope(Some(traces.clone()), self.dispatch(request, context)),
+                        )
+                        .await
+                }
+                None => self.dispatch(request, context).await,
             }
-            None => self.dispatch(request, context).await,
         };
 
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);

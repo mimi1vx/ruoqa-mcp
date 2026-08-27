@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,8 +54,8 @@ pub enum RecordScope {
 pub enum Event {
     SessionOpen,
     ToolCall,
-    /// Reserved for the fail-closed gate (a later phase); the schema is
-    /// pinned here but nothing in this phase emits it.
+    /// Emitted once, by [`Auditor`]'s own recovery path, when persistence
+    /// resumes after an outage: never by a tool call.
     AuditGap,
     Shutdown,
 }
@@ -115,6 +115,15 @@ pub struct Record {
     trace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     span: Option<String>,
+    /// `AuditGap`-only fields (additive to `v = 1`, like `trace`/`span`
+    /// above): how many appends failed, when the first one did, and how
+    /// many calls the gate refused during the outage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refused: Option<u64>,
 }
 
 impl Record {
@@ -137,6 +146,9 @@ impl Record {
             duration_ms: None,
             trace: None,
             span: None,
+            count: None,
+            since: None,
+            refused: None,
         }
     }
 }
@@ -219,8 +231,9 @@ fn summarize(value: &Value) -> Value {
     json!({ "_len": len })
 }
 
-/// `open` | `closed_writes` | `closed_all`. Parsed and validated in this
-/// phase; gating on it is a later phase's job.
+/// `open` | `closed_writes` | `closed_all`: whether a tool call is refused
+/// while the audit stream cannot persist. See [`AuditConfig::fail_mode_for`]
+/// for what an absent key resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailMode {
@@ -235,16 +248,12 @@ struct RawAuditConfig {
     path: String,
     #[serde(default)]
     fsync: bool,
-    #[serde(default = "default_fail_mode")]
-    fail_mode: FailMode,
+    #[serde(default)]
+    fail_mode: Option<FailMode>,
     #[serde(default = "default_rotate_max_bytes")]
     rotate_max_bytes: u64,
     #[serde(default = "default_rotate_keep")]
     rotate_keep: u32,
-}
-
-fn default_fail_mode() -> FailMode {
-    FailMode::Open
 }
 
 fn default_rotate_max_bytes() -> u64 {
@@ -262,7 +271,9 @@ pub struct AuditConfig {
     /// `None` when `path = "none"`: no file sink at all.
     pub path: Option<PathBuf>,
     pub fsync: bool,
-    pub fail_mode: FailMode,
+    /// `None` means the operator did not say: see [`Self::fail_mode_for`]
+    /// for the transport-dependent default this resolves to.
+    pub fail_mode: Option<FailMode>,
     pub rotate_max_bytes: u64,
     /// Clamped to `1..=10_000`.
     pub rotate_keep: usize,
@@ -300,6 +311,18 @@ impl AuditConfig {
             fail_mode: raw.fail_mode,
             rotate_max_bytes: raw.rotate_max_bytes,
             rotate_keep: usize::try_from(raw.rotate_keep.clamp(1, 10_000)).unwrap_or(10_000),
+        })
+    }
+
+    /// Resolve `fail_mode` against the serving transport: an operator who
+    /// said nothing gets `open` on stdio (a dead collector must never take a
+    /// reviewer's local session offline) and `closed_all` on HTTP (a shared
+    /// deployment defaults to the safer failure mode).
+    #[must_use]
+    pub fn fail_mode_for(&self, transport: Transport) -> FailMode {
+        self.fail_mode.unwrap_or(match transport {
+            Transport::Stdio => FailMode::Open,
+            Transport::Http => FailMode::ClosedAll,
         })
     }
 }
@@ -451,14 +474,37 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// An in-progress or just-closed persistence outage, tracked alongside the
+/// sink under the same lock. `count`/`since` describe append failures;
+/// `refused` is a separate counter (records lost and work refused are
+/// different operator questions) and can grow with no `count` yet — a call
+/// refused by delivery health before any append ever failed.
+struct Gap {
+    count: u64,
+    since: String,
+    refused: u64,
+}
+
+/// The sink and its outage bookkeeping, one lock for both: `write()` already
+/// holds this exactly where a failure or recovery is detected, and two locks
+/// in a fixed order is a deadlock waiting for a future refactor to reverse
+/// them.
+#[derive(Default)]
+struct SinkState {
+    sink: Option<Sink>,
+    gap: Option<Gap>,
+}
+
 /// The audit stream's write side: session id, sequence numbering, the
 /// (optional) file sink, and the (optional) OTLP bridge.
 pub struct Auditor {
-    /// Always a real `Mutex`, even with no file sink: the lock is what makes
-    /// `seq` order equal emission order, and the OTLP export must inherit
-    /// that guarantee too, not just the file.
-    sink: Mutex<Option<Sink>>,
+    sink: Mutex<SinkState>,
     otlp: Option<LogProducer>,
+    /// Fast path for the fail-closed gate: one relaxed load, no lock. The
+    /// authoritative detail lives in `sink.gap`; this is its cached
+    /// predicate. `false` (persisting fine) until a write proves otherwise.
+    failing: AtomicBool,
+    fail_mode: FailMode,
     seq: AtomicU64,
     process_session: String,
 }
@@ -472,19 +518,32 @@ impl Auditor {
     /// not be created, or if the path is a symlink.
     pub fn open(cfg: &AuditConfig) -> io::Result<Self> {
         Ok(Self {
-            sink: Mutex::new(Sink::open(cfg)?),
+            sink: Mutex::new(SinkState {
+                sink: Sink::open(cfg)?,
+                gap: None,
+            }),
             otlp: None,
+            failing: AtomicBool::new(false),
+            fail_mode: FailMode::Open,
             seq: AtomicU64::new(1),
             process_session: process_session_id(),
         })
     }
 
-    /// Bridge every record onto the OTLP logs pipeline too, tagged
-    /// `ruoqa.stream = "audit"`. `path = "none"` plus this is what makes a
-    /// collector the *only* audit sink.
+    /// Bridge every record onto the audit stream's own OTLP export task too,
+    /// tagged `ruoqa.stream = "audit"`. `path = "none"` plus this is what
+    /// makes a collector the *only* audit sink, and this producer's delivery
+    /// health is then what the fail-closed gate reads.
     #[must_use]
     pub fn with_otlp(mut self, producer: LogProducer) -> Self {
         self.otlp = Some(producer);
+        self
+    }
+
+    /// Set the fail mode the gate enforces once persistence is failing.
+    #[must_use]
+    pub fn with_fail_mode(mut self, mode: FailMode) -> Self {
+        self.fail_mode = mode;
         self
     }
 
@@ -494,28 +553,123 @@ impl Auditor {
         &self.process_session
     }
 
+    /// Whether the fail-closed gate refuses a call of this `scope` right
+    /// now: one relaxed atomic load plus a match, no lock, nothing when
+    /// persistence is healthy. The mode governs the *next* call — this
+    /// reflects the outcome of the most recent write, not a live probe.
+    #[must_use]
+    pub fn refuses(&self, scope: RecordScope) -> bool {
+        if !self.failing.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.fail_mode {
+            FailMode::Open => false,
+            FailMode::ClosedWrites => matches!(scope, RecordScope::Write),
+            FailMode::ClosedAll => true,
+        }
+    }
+
+    /// Record that the gate refused one call, for the recovery gap's
+    /// `refused` count. Creates the gap if the outage was detected by
+    /// delivery health rather than by a failed append (no write has failed
+    /// yet to have created one).
+    pub fn refused(&self) {
+        let mut guard = self
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gap = guard.gap.get_or_insert_with(|| Gap {
+            count: 0,
+            since: now_rfc3339(),
+            refused: 0,
+        });
+        gap.refused += 1;
+    }
+
     /// Assign `seq`/`ts`, serialise, and append/export, all under the same
     /// lock so file order and OTLP emission order both equal sequence order.
     /// A no-op — no lock contention, no seq spent — only when neither a file
     /// sink nor an OTLP producer is configured.
+    ///
+    /// Persistence health is judged by the file sink's append result when
+    /// one is configured; only when there is *no* file sink does the OTLP
+    /// producer's delivery health stand in for it (boundary 3: a working
+    /// file sink is never gated by a flaky collector).
     fn write(&self, mut record: Record) {
         let mut guard = self
             .sink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_none() && self.otlp.is_none() {
+        if guard.sink.is_none() && self.otlp.is_none() {
             return;
         }
         record.seq = self.seq.fetch_add(1, Ordering::SeqCst);
         record.ts = now_rfc3339();
         let line = serde_json::to_string(&record).expect("Record serialization cannot fail");
-        if let Some(sink) = guard.as_mut()
-            && let Err(e) = sink.append(&line)
+
+        let persisted = if let Some(sink) = guard.sink.as_mut() {
+            match sink.append(&line) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %sink.path.display(), "audit sink append failed");
+                    false
+                }
+            }
+        } else {
+            // No file sink reached this point only because `self.otlp` is
+            // `Some` (the early return above covers "neither").
+            self.otlp.as_ref().is_some_and(LogProducer::is_delivering)
+        };
+
+        if let Some(otlp) = &self.otlp {
+            otlp.enqueue(encode_otlp_record(&record, &line));
+        }
+
+        self.update_gap(&mut guard, persisted, record.transport, &record.ts);
+    }
+
+    /// Updates `failing`/`gap` for one write's outcome. On recovery
+    /// (`persisted` true with a gap pending), appends an `AuditGap` record
+    /// *inline*, inside this same guard — never by re-entering `write()`,
+    /// which would deadlock on this non-reentrant `Mutex`. This is also why
+    /// the file reads *recovering record, then the gap that preceded it*:
+    /// recovery is only knowable by a write succeeding, so the gap record
+    /// can never be written first.
+    fn update_gap(&self, guard: &mut SinkState, persisted: bool, transport: Transport, ts: &str) {
+        if !persisted {
+            self.failing.store(true, Ordering::Relaxed);
+            let gap = guard.gap.get_or_insert_with(|| Gap {
+                count: 0,
+                since: ts.to_string(),
+                refused: 0,
+            });
+            gap.count += 1;
+            return;
+        }
+        self.failing.store(false, Ordering::Relaxed);
+        let Some(gap) = guard.gap.take() else {
+            return;
+        };
+        let mut gap_record = Record::event(
+            self.process_session.clone(),
+            transport,
+            RecordScope::None,
+            Event::AuditGap,
+        );
+        gap_record.count = Some(gap.count);
+        gap_record.since = Some(gap.since);
+        gap_record.refused = Some(gap.refused);
+        gap_record.seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        gap_record.ts = now_rfc3339();
+        let gap_line =
+            serde_json::to_string(&gap_record).expect("Record serialization cannot fail");
+        if let Some(sink) = guard.sink.as_mut()
+            && let Err(e) = sink.append(&gap_line)
         {
             tracing::warn!(error = %e, path = %sink.path.display(), "audit sink append failed");
         }
         if let Some(otlp) = &self.otlp {
-            otlp.enqueue(encode_otlp_record(&record, &line));
+            otlp.enqueue(encode_otlp_record(&gap_record, &gap_line));
         }
     }
 
@@ -633,6 +787,18 @@ fn otlp_attributes(record: &Record) -> (logs::Severity, Vec<(&'static str, Audit
         }
         None => {}
     }
+    if let Some(count) = record.count {
+        attrs.push((
+            "count",
+            AuditAttr::Int(i64::try_from(count).unwrap_or(i64::MAX)),
+        ));
+    }
+    if let Some(refused) = record.refused {
+        attrs.push((
+            "refused",
+            AuditAttr::Int(i64::try_from(refused).unwrap_or(i64::MAX)),
+        ));
+    }
     (severity, attrs)
 }
 
@@ -699,17 +865,34 @@ mod tests {
     }
 
     #[test]
-    fn audit_gap_serializes_pinned_shape_though_unused_in_this_phase() {
-        let record = Record::event(
+    fn audit_gap_serializes_pinned_shape_with_count_since_refused() {
+        let mut record = Record::event(
             "s1".to_string(),
             Transport::Stdio,
             RecordScope::None,
             Event::AuditGap,
         );
+        record.count = Some(3);
+        record.since = Some("2024-01-01T00:00:00.000Z".to_string());
+        record.refused = Some(1);
         assert_eq!(
             line(&record),
-            r#"{"v":1,"ts":"","seq":0,"session":"s1","transport":"stdio","scope":"none","event":"audit_gap"}"#
+            r#"{"v":1,"ts":"","seq":0,"session":"s1","transport":"stdio","scope":"none","event":"audit_gap","count":3,"since":"2024-01-01T00:00:00.000Z","refused":1}"#
         );
+    }
+
+    #[test]
+    fn a_tool_call_record_never_carries_the_audit_gap_fields() {
+        let record = Record::event(
+            "s1".to_string(),
+            Transport::Stdio,
+            RecordScope::None,
+            Event::ToolCall,
+        );
+        let serialized = line(&record);
+        assert!(!serialized.contains("count"));
+        assert!(!serialized.contains("since"));
+        assert!(!serialized.contains("refused"));
     }
 
     #[test]
@@ -817,9 +1000,19 @@ mod tests {
         let cfg = AuditConfig::parse("path = \"/var/log/audit.jsonl\"\n").unwrap();
         assert_eq!(cfg.path, Some(PathBuf::from("/var/log/audit.jsonl")));
         assert!(!cfg.fsync);
-        assert_eq!(cfg.fail_mode, FailMode::Open);
+        assert_eq!(cfg.fail_mode, None);
+        assert_eq!(cfg.fail_mode_for(Transport::Stdio), FailMode::Open);
+        assert_eq!(cfg.fail_mode_for(Transport::Http), FailMode::ClosedAll);
         assert_eq!(cfg.rotate_max_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.rotate_keep, 8);
+    }
+
+    #[test]
+    fn fail_mode_for_an_explicit_value_ignores_transport() {
+        let cfg = AuditConfig::parse("path = \"none\"\nfail_mode = \"closed_writes\"\n").unwrap();
+        assert_eq!(cfg.fail_mode, Some(FailMode::ClosedWrites));
+        assert_eq!(cfg.fail_mode_for(Transport::Stdio), FailMode::ClosedWrites);
+        assert_eq!(cfg.fail_mode_for(Transport::Http), FailMode::ClosedWrites);
     }
 
     #[test]
@@ -1001,12 +1194,145 @@ mod tests {
         assert!(!numbered(&path, 1).exists());
     }
 
+    /// Deterministic append failure with no test-only hook: a read-only
+    /// *directory* leaves the already-open fd writable (writes to an open fd
+    /// only need file permissions), but `rotate()`'s `std::fs::rename` needs
+    /// to write the directory entry and fails with a real `EACCES` once the
+    /// bound is crossed — the real code path, not an injection point.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code, reason = "geteuid reads process state, no preconditions")]
+    fn append_failure_then_recovery_emits_exactly_one_audit_gap_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` reads process state, no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping append_failure_then_recovery_emits_exactly_one_audit_gap_record: \
+                 root ignores directory mode bits"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let cfg = AuditConfig::parse(&format!(
+            "path = {:?}\nrotate_max_bytes = 4096\nrotate_keep = 3\n",
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+        let auditor = Auditor::open(&cfg).unwrap();
+        auditor.session_open("s0", Transport::Stdio);
+        assert!(!auditor.failing.load(Ordering::Relaxed));
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // A failed `rotate()` never reaches `write_all`, so the live file's
+        // length never advances while locked: every one of these oversized
+        // records crosses the 4096-byte bound again, off the same stale
+        // length, and fails again — a sustained outage, not just one blip.
+        let oversized = json!({"text": "x".repeat(5000)});
+        for i in 0..3 {
+            auditor.tool_call(
+                format!("locked-{i}"),
+                Transport::Stdio,
+                RecordScope::Write,
+                "add_job_comment",
+                None,
+                Some(oversized.clone()),
+                Outcome::Ok,
+                0,
+                None,
+            );
+        }
+        assert!(
+            auditor.failing.load(Ordering::Relaxed),
+            "a rotate() failure under a read-only directory must set `failing`"
+        );
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Small again: comfortably under the bound relative to the ~100
+        // bytes still on disk, so recovery itself needs no further rotation.
+        auditor.session_open("recovered", Transport::Stdio);
+        assert!(!auditor.failing.load(Ordering::Relaxed));
+        // A second recovery with no intervening failure must emit nothing.
+        auditor.session_open("after", Transport::Stdio);
+
+        let lines = read_all_lines(&path);
+        let gap_lines: Vec<&Value> = lines.iter().filter(|l| l["event"] == "audit_gap").collect();
+        assert_eq!(gap_lines.len(), 1, "exactly one audit_gap line: {lines:?}");
+        let gap = gap_lines[0];
+        assert_eq!(gap["count"], 3, "one per failed append");
+        assert!(gap["since"].is_string());
+        assert_eq!(gap["refused"], 0);
+
+        // The recovering record precedes the gap that describes it: recovery
+        // is only knowable by a write succeeding, so the gap cannot come first.
+        let recovered_seq = lines.iter().find(|l| l["session"] == "recovered").unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        assert!(gap["seq"].as_u64().unwrap() > recovered_seq);
+    }
+
+    /// `refused()` alone (no append ever failed) still creates a gap: the
+    /// outage was detected by delivery health, not by a failed append.
+    #[test]
+    fn refused_creates_a_gap_when_none_exists_yet() {
+        let cfg = AuditConfig::parse("path = \"none\"\n").unwrap();
+        let auditor = Auditor::open(&cfg).unwrap();
+        auditor.refused();
+        auditor.refused();
+        let guard = auditor.sink.lock().unwrap();
+        let gap = guard.gap.as_ref().expect("refused() must create a gap");
+        assert_eq!(gap.refused, 2);
+        assert_eq!(gap.count, 0);
+    }
+
+    #[test]
+    fn refuses_matches_fail_mode_and_scope_when_failing() {
+        let cfg = AuditConfig::parse("path = \"none\"\n").unwrap();
+
+        let open = Auditor::open(&cfg).unwrap().with_fail_mode(FailMode::Open);
+        open.failing.store(true, Ordering::Relaxed);
+        assert!(!open.refuses(RecordScope::Read));
+        assert!(!open.refuses(RecordScope::Write));
+
+        let closed_writes = Auditor::open(&cfg)
+            .unwrap()
+            .with_fail_mode(FailMode::ClosedWrites);
+        closed_writes.failing.store(true, Ordering::Relaxed);
+        assert!(!closed_writes.refuses(RecordScope::Read));
+        assert!(closed_writes.refuses(RecordScope::Write));
+
+        let closed_all = Auditor::open(&cfg)
+            .unwrap()
+            .with_fail_mode(FailMode::ClosedAll);
+        closed_all.failing.store(true, Ordering::Relaxed);
+        assert!(closed_all.refuses(RecordScope::Read));
+        assert!(closed_all.refuses(RecordScope::Write));
+    }
+
+    #[test]
+    fn refuses_is_always_false_while_healthy() {
+        let cfg = AuditConfig::parse("path = \"none\"\n").unwrap();
+        let auditor = Auditor::open(&cfg)
+            .unwrap()
+            .with_fail_mode(FailMode::ClosedAll);
+        assert!(!auditor.refuses(RecordScope::Read));
+        assert!(!auditor.refuses(RecordScope::Write));
+    }
+
+    fn read_all_lines(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     fn stub_producer() -> (LogProducer, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        (
-            LogProducer(crate::otel::pipeline::Producer::for_test(tx)),
-            rx,
-        )
+        (LogProducer::for_test(tx), rx)
     }
 
     #[test]

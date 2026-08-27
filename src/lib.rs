@@ -39,9 +39,26 @@ impl Telemetry {
     /// startup probe fails after its bounded retries — fatal by design, so
     /// this must run before a socket is bound or a stdio session is served.
     pub async fn init() -> anyhow::Result<Option<Self>> {
+        Self::init_impl(false).await
+    }
+
+    /// Same as [`init`](Self::init), but also starts a second, independent
+    /// export task for the audit stream when the logs signal is configured
+    /// and `audit_stream` is `true`. Callers pass `true` exactly when
+    /// `--audit-config` is set — the CLI already knows this by the time
+    /// telemetry starts.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`init`](Self::init).
+    pub async fn init_with_audit_stream(audit_stream: bool) -> anyhow::Result<Option<Self>> {
+        Self::init_impl(audit_stream).await
+    }
+
+    async fn init_impl(audit_stream: bool) -> anyhow::Result<Option<Self>> {
         match otel::env::from_env().context("invalid OTEL_* configuration")? {
             Some(cfg) => {
-                let telemetry = otel::Telemetry::init(&cfg)
+                let telemetry = otel::Telemetry::init(&cfg, audit_stream)
                     .await
                     .context("OTLP startup probe failed")?;
                 Ok(Some(Self(telemetry)))
@@ -62,7 +79,24 @@ impl Telemetry {
     /// configured.
     #[must_use]
     pub fn log_producer(&self) -> Option<LogProducer> {
-        self.0.log_producer().map(LogProducer)
+        self.0.log_producer().map(|producer| LogProducer {
+            producer,
+            health: None,
+        })
+    }
+
+    /// A send handle onto the audit stream's own export task, plus its
+    /// delivery health, for [`audit::Auditor::with_otlp`]. `None` unless
+    /// [`init_with_audit_stream`](Self::init_with_audit_stream) was called
+    /// with `true` and the logs signal is configured.
+    #[must_use]
+    pub fn audit_producer(&self) -> Option<LogProducer> {
+        self.0
+            .audit_producer()
+            .map(|(producer, health)| LogProducer {
+                producer,
+                health: Some(health),
+            })
     }
 
     /// A send handle onto the traces pipeline plus the resolved
@@ -101,15 +135,42 @@ impl Telemetry {
     }
 }
 
-/// Opaque send handle onto the logs export pipeline, for the audit stream to
+/// Opaque send handle onto a logs export pipeline, for the audit stream to
 /// piggyback on. No `Debug`: the records it carries may include tool
 /// arguments.
+///
+/// `health` is `Some` only when this handle came from
+/// [`Telemetry::audit_producer`] — the audit stream's own dedicated export
+/// task; a handle from [`Telemetry::log_producer`] (the shared diagnostics
+/// pipeline) carries `None`, and [`Self::is_delivering`] always answers
+/// `true` for it, because nothing gates on the diagnostics stream's health.
 #[derive(Clone)]
-pub struct LogProducer(otel::pipeline::Producer);
+pub struct LogProducer {
+    producer: otel::pipeline::Producer,
+    health: Option<std::sync::Arc<otel::pipeline::Health>>,
+}
 
 impl LogProducer {
     pub(crate) fn enqueue(&self, encoded_record: Vec<u8>) {
-        self.0.enqueue(encoded_record);
+        self.producer.enqueue(encoded_record);
+    }
+
+    /// Whether the underlying export task is currently delivering, for the
+    /// audit fail-closed gate.
+    pub(crate) fn is_delivering(&self) -> bool {
+        self.health.as_ref().is_none_or(|h| h.is_delivering())
+    }
+}
+
+#[cfg(test)]
+impl LogProducer {
+    /// Bypasses `Exporter::start`'s task/HTTP machinery, for `audit.rs`'s
+    /// tests, which only need to observe what gets enqueued.
+    pub(crate) fn for_test(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            producer: otel::pipeline::Producer::for_test(tx),
+            health: None,
+        }
     }
 }
 

@@ -70,7 +70,7 @@ async fn serve() -> anyhow::Result<()> {
     // so this comes before telemetry. Preflight, fatal, still before any
     // socket: resolve `OTEL_*`, probe the collector, start its export task.
     let cli = Cli::parse();
-    let telemetry = Telemetry::init().await?;
+    let telemetry = Telemetry::init_with_audit_stream(cli.audit_config.is_some()).await?;
     init_tracing(telemetry.as_ref());
     run(cli, telemetry).await
 }
@@ -126,10 +126,10 @@ async fn run(cli: Cli, telemetry: Option<Telemetry>) -> anyhow::Result<()> {
     // Telemetry is already up (resolved and probed in `serve()`, before this
     // function even started), so the sink can bridge onto the OTLP pipeline
     // from the moment it opens.
-    let log_producer = telemetry.as_ref().and_then(Telemetry::log_producer);
+    let audit_producer = telemetry.as_ref().and_then(Telemetry::audit_producer);
     let trace_producer = telemetry.as_ref().and_then(Telemetry::trace_producer);
     let metric_recorder = telemetry.as_ref().and_then(Telemetry::metric_recorder);
-    let audit = build_auditor(cli.audit_config.as_deref(), log_producer)?;
+    let audit = build_auditor(cli.audit_config.as_deref(), transport, audit_producer)?;
 
     let servers =
         build_registry(&EnvConfig::from_env()).context("failed to build openQA server registry")?;
@@ -174,23 +174,45 @@ async fn run(cli: Cli, telemetry: Option<Telemetry>) -> anyhow::Result<()> {
 }
 
 /// Parse `path` (if given) into an [`Auditor`], opening its sink and
-/// bridging it onto `log_producer` when telemetry is configured. `None`
+/// bridging it onto `audit_producer` when telemetry is configured. `None`
 /// (for `path`) disables auditing entirely: no config was requested at all.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or parsed, if the
+/// sink cannot be opened, or if the resolved fail mode is closed but there
+/// is nothing to gate on (no file sink and no OTLP logs signal) — a mode
+/// that could never engage is rejected rather than served.
 fn build_auditor(
     path: Option<&std::path::Path>,
-    log_producer: Option<ruoqa_mcp::LogProducer>,
+    transport: Transport,
+    audit_producer: Option<ruoqa_mcp::LogProducer>,
 ) -> anyhow::Result<Option<Arc<Auditor>>> {
     let Some(path) = path else { return Ok(None) };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read audit config {}", path.display()))?;
     let cfg = AuditConfig::parse(&text)?;
-    let mut auditor = Auditor::open(&cfg).with_context(|| {
-        format!(
-            "failed to open the audit sink configured in {}",
-            path.display()
-        )
-    })?;
-    if let Some(producer) = log_producer {
+    let fail_mode = cfg.fail_mode_for(transport);
+    if fail_mode != ruoqa_mcp::audit::FailMode::Open
+        && cfg.path.is_none()
+        && audit_producer.is_none()
+    {
+        anyhow::bail!(
+            "audit fail_mode {fail_mode:?} has nothing to gate on: `path` is \"none\" and no \
+             OTLP logs signal is configured (OTEL_EXPORTER_OTLP_ENDPOINT / \
+             OTEL_EXPORTER_OTLP_LOGS_ENDPOINT); set `path` to a file, configure the collector, \
+             or set fail_mode = \"open\""
+        );
+    }
+    let mut auditor = Auditor::open(&cfg)
+        .with_context(|| {
+            format!(
+                "failed to open the audit sink configured in {}",
+                path.display()
+            )
+        })?
+        .with_fail_mode(fail_mode);
+    if let Some(producer) = audit_producer {
         auditor = auditor.with_otlp(producer);
     }
     Ok(Some(Arc::new(auditor)))
@@ -277,4 +299,54 @@ async fn run_http(server: OpenQaServer, auth: HttpAuth, cli: &Cli) -> anyhow::Re
         .with_graceful_shutdown(async move { ct.cancelled().await })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_cfg(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.toml");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn closed_mode_with_no_file_and_no_otlp_fails_startup_naming_everything() {
+        let (_dir, cfg_path) = write_cfg("path = \"none\"\nfail_mode = \"closed_all\"\n");
+        let Err(err) = build_auditor(Some(&cfg_path), Transport::Http, None) else {
+            panic!("expected a startup error");
+        };
+        let message = err.to_string();
+        assert!(message.contains("fail_mode"), "{message}");
+        assert!(message.contains("path"), "{message}");
+        assert!(message.contains("OTEL_EXPORTER_OTLP_ENDPOINT"), "{message}");
+    }
+
+    #[test]
+    fn closed_mode_with_a_file_sink_starts_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let (_cfg_dir, cfg_path) = write_cfg(&format!(
+            "path = {:?}\nfail_mode = \"closed_all\"\n",
+            audit_path.to_str().unwrap()
+        ));
+        assert!(build_auditor(Some(&cfg_path), Transport::Http, None).is_ok());
+    }
+
+    #[test]
+    fn open_mode_with_no_file_and_no_otlp_starts_fine() {
+        let (_dir, cfg_path) = write_cfg("path = \"none\"\nfail_mode = \"open\"\n");
+        assert!(build_auditor(Some(&cfg_path), Transport::Http, None).is_ok());
+    }
+
+    #[test]
+    fn no_path_disables_auditing_entirely() {
+        assert!(
+            build_auditor(None, Transport::Stdio, None)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

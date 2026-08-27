@@ -85,6 +85,21 @@ pub(crate) fn tool_error(
     )?]))
 }
 
+/// The audit fail-closed gate's one refusal shape: `kind = "audit_unavailable"`
+/// in the same `tool_error` JSON every other failure uses, so a refused call
+/// is labelled identically wherever `outcome_of` reads it back — the DEBUG
+/// event, the metric, the span and the audit record. Never names a path or
+/// an endpoint: an operator learns the call was not attempted, not how the
+/// gate is wired.
+pub(crate) fn audit_unavailable() -> Result<CallToolResult, ErrorData> {
+    tool_error(
+        "audit_unavailable",
+        None,
+        "the audit stream is unavailable; this call was not attempted",
+        None,
+    )
+}
+
 /// Truncate `s` to at most `max_bytes` bytes, on a char boundary. Naive
 /// `&s[..max_bytes]` panics if it lands inside a multi-byte UTF-8 sequence.
 /// Shared with `otel::logs`, which applies the same rule to diagnostics

@@ -24,6 +24,11 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 /// signal's own registry and periodic reader.
 pub(crate) struct Telemetry {
     logs: Option<pipeline::Exporter>,
+    /// A second, independent export task onto the same `/v1/logs` endpoint
+    /// as `logs`, for the audit stream only. `None` unless both the logs
+    /// signal is configured and the caller asked for it (`--audit-config`
+    /// is set) — with no audit config, no second task exists at all.
+    audit: Option<pipeline::Exporter>,
     traces: Option<pipeline::Exporter>,
     metrics: Option<metrics::MetricsPipeline>,
     sampler: env::Sampler,
@@ -35,11 +40,18 @@ impl Telemetry {
     /// is awaited and fatal: a startup error here means `run()` returns
     /// before any socket is bound, on both transports.
     ///
+    /// `audit_stream` starts a second, independent export task onto the
+    /// same logs endpoint when `true` and the logs signal is configured —
+    /// `true` exactly when `--audit-config` is set. No second probe: the one
+    /// above already proved this endpoint, these headers and this encoder
+    /// are accepted, and posting an identical startup record again would
+    /// double a startup cost to prove nothing new.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `reqwest::Client` cannot be built, or if a
     /// configured signal's startup probe fails after its bounded retries.
-    pub(crate) async fn init(cfg: &OtelConfig) -> anyhow::Result<Self> {
+    pub(crate) async fn init(cfg: &OtelConfig, audit_stream: bool) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .build()
             .context("failed to build the OTLP HTTP client")?;
@@ -57,6 +69,16 @@ impl Telemetry {
                 ))
             }
             None => None,
+        };
+
+        let audit = match (&cfg.logs, audit_stream) {
+            (Some(signal), true) => Some(start_logs_exporter(
+                client.clone(),
+                &cfg.service_name,
+                signal,
+                cfg.queue,
+            )),
+            _ => None,
         };
 
         let traces = match &cfg.traces {
@@ -93,6 +115,7 @@ impl Telemetry {
 
         Ok(Self {
             logs,
+            audit,
             traces,
             metrics,
             sampler: cfg.sampler,
@@ -104,11 +127,12 @@ impl Telemetry {
     /// `SHUTDOWN_BUDGET` *per signal* on the way out of a stdio session.
     /// Called unconditionally on the way out, including on a failing run:
     /// the stdio path's `process::exit(0)` runs no destructors, so this is
-    /// the only flush that happens. One `join!` over three `Option`s rather
-    /// than an eight-arm match on all three at once.
+    /// the only flush that happens. The audit exporter is a peer here, not
+    /// flushed before or after the rest.
     pub(crate) async fn shutdown(self) {
         tokio::join!(
             maybe_shutdown_exporter(self.logs),
+            maybe_shutdown_exporter(self.audit),
             maybe_shutdown_exporter(self.traces),
             maybe_shutdown_metrics(self.metrics),
         );
@@ -118,6 +142,16 @@ impl Telemetry {
     /// piggyback on. `None` when the logs signal is not configured.
     pub(crate) fn log_producer(&self) -> Option<pipeline::Producer> {
         self.logs.as_ref().map(pipeline::Exporter::producer)
+    }
+
+    /// A send handle onto the audit stream's own export task, plus its
+    /// delivery health for the fail-closed gate. `None` unless
+    /// `audit_stream` was `true` at [`Telemetry::init`] and the logs signal
+    /// is configured.
+    pub(crate) fn audit_producer(&self) -> Option<(pipeline::Producer, Arc<pipeline::Health>)> {
+        self.audit
+            .as_ref()
+            .map(|exporter| (exporter.producer(), exporter.health()))
     }
 
     /// A send handle onto the traces pipeline plus the resolved
