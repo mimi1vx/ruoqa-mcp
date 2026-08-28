@@ -8,6 +8,8 @@ services:
       OPENQA_SERVER: openqa.example.com
       OPENQA_MCP_HTTP_TOKEN: ${OPENQA_MCP_HTTP_TOKEN:?set OPENQA_MCP_HTTP_TOKEN}
       OPENQA_MCP_ALLOWED_HOSTS: ""
+    # read_only stays true even with auditing enabled below: the named
+    # audit-data volume is the only writable mount, which is the point.
     read_only: true
     cap_drop:
       - ALL
@@ -17,5 +19,25 @@ services:
     #   - ./client.conf:/etc/openqa/client.conf:ro
     #   # OPENQA_VERIFY replaces the platform trust store, not merges with it.
     #   - ./ca.pem:/etc/ssl/custom/ca.pem:ro
+    #   # Auditing: config and the volume it points at travel together, never
+    #   # apart -- a config with no volume behind it is a closed_all outage
+    #   # waiting to happen. A NAMED volume (as below) inherits write access
+    #   # for uid 65532 from the image; a BIND mount instead needs the host
+    #   # directory already owned by 65532.
+    #   - ./audit.toml:/etc/ruoqa-mcp/audit.toml:ro
+    #   - audit-data:/var/lib/ruoqa-mcp
     # environment:
     #   OPENQA_VERIFY: /etc/ssl/custom/ca.pem
+    #   OPENQA_MCP_AUDIT_CONFIG: /etc/ruoqa-mcp/audit.toml
+    #   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+
+  # otel-collector:
+  #   image: otel/opentelemetry-collector-contrib:<pinned>
+  #   volumes:
+  #     - ./docs/examples/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+  #     - audit-data:/var/lib/ruoqa-mcp:ro
+  #   ports:
+  #     - "4318:4318"
+
+# volumes:
+#   audit-data:

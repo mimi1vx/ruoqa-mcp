@@ -86,8 +86,11 @@ a custom CA with the platform roots, this is stricter than before.
 ### `~/.env`
 
 Keeping a long-running server's configuration in a shell profile is awkward, so
-**every** variable in this README — the ones above, the HTTP ones below, and
-`RUST_LOG` — may instead live in `~/.env`, read once at startup:
+every variable in this README — the ones above, the HTTP ones below, and
+`RUST_LOG` — may instead live in `~/.env`, read once at startup. The same is
+true of the `OTEL_*` variables in [`docs/observability.md`](docs/observability.md):
+`load_home_env()` runs before both `clap` and telemetry initialize, so
+`~/.env` reaches them just as well.
 
 ```sh
 umask 077
@@ -290,7 +293,9 @@ A tool call fails one of two ways:
   `forbidden`, `not_found`, `rate_limited`, `bad_request`, `server_error`,
   `connection`, `timeout`, `response_too_large`, `invalid_response`,
   `unsupported_media` (a `get_job_log` artifact that isn't text, e.g. a
-  video or image).
+  video or image), `audit_unavailable` (the audit stream cannot persist and
+  the configured [fail mode](docs/observability.md#fail-modes) refuses the
+  call — openQA was never asked).
 - **The server itself is misconfigured or refused to route the request**
   (bad `client.conf`, TLS setup failure, incomplete credentials, a
   cross-origin or outside-base-URL request). This is a JSON-RPC
@@ -485,6 +490,25 @@ Gotchas specific to the image:
 There is no `/health` endpoint or `HEALTHCHECK` (the distroless base has no
 shell or curl to run one); orchestrators should use a TCP check or an
 authenticated `GET /mcp` from outside the container.
+
+## Observability
+
+Two independent, opt-in streams: a JSONL audit log of every tool call, and
+OpenTelemetry logs/traces/metrics over OTLP/HTTP. Both are off unless
+configured, and turning one on has no effect on the other.
+
+- **Audit stream:** set `--audit-config` / `OPENQA_MCP_AUDIT_CONFIG` to a
+  TOML file naming a `path` to append to.
+- **OTLP export:** set `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal
+  `_LOGS`/`_TRACES`/`_METRICS_ENDPOINT`) to a collector.
+
+Two things worth knowing before enabling either: the exported audit stream is
+exactly as sensitive as the file it mirrors, since it carries comment text
+and other arguments verbatim; and `OTEL_EXPORTER_OTLP_HEADERS` is a
+credential, so it is environment-only and never logged.
+
+See [`docs/observability.md`](docs/observability.md) for the full variable
+and key tables, the record schema, and the fail-mode semantics.
 
 ## Development
 

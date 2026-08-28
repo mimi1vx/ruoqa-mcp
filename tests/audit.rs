@@ -286,3 +286,22 @@ async fn no_audit_config_creates_no_file() {
         "no audit file must appear anywhere when auditing is unconfigured"
     );
 }
+
+/// A stale example is worse than none: this parses `docs/examples/audit.toml`
+/// through the real strict loader, so a renamed or removed key fails the
+/// suite instead of drifting silently.
+#[test]
+fn example_audit_toml_parses() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/examples/audit.toml"
+    ))
+    .expect("read docs/examples/audit.toml");
+    let cfg = AuditConfig::parse(&text).expect("docs/examples/audit.toml must parse");
+    assert_eq!(
+        cfg.path.as_deref(),
+        Some(std::path::Path::new("/var/lib/ruoqa-mcp/audit.jsonl"))
+    );
+    assert_eq!(cfg.rotate_max_bytes, 67_108_864);
+    assert_eq!(cfg.rotate_keep, 8);
+}

@@ -1,0 +1,31 @@
+# Example audit-stream configuration. Point --audit-config / OPENQA_MCP_AUDIT_CONFIG
+# at a copy of this file, with `path` changed to a real, writable location.
+# Every key below is optional except `path`; unrecognized keys are a startup error.
+
+# Where the JSONL audit log is appended. Required. Use "none" to disable the
+# file sink entirely (see the commented block at the bottom).
+path = "/var/lib/ruoqa-mcp/audit.jsonl"
+
+# Call fsync() after every append. Costs latency, buys durability across a
+# crash; the default trusts the OS page cache.
+fsync = false
+
+# Whether a tool call is refused while the audit stream cannot persist:
+# "open" (never refuse), "closed_writes" (refuse write-scope calls only), or
+# "closed_all" (refuse every call). Left unset, this resolves per transport:
+# "open" on stdio, "closed_all" on HTTP.
+# fail_mode = "open"
+
+# Rotate the file once the next append would cross this many bytes. 0 disables
+# rotation.
+rotate_max_bytes = 67108864
+
+# How many rotated files to keep (path.1, path.2, ...) before the oldest is
+# deleted.
+rotate_keep = 8
+
+# Collector-only variant: no file sink at all. Requires an OTLP logs endpoint
+# to be configured too (OTEL_EXPORTER_OTLP_ENDPOINT or _LOGS_ENDPOINT) --
+# with path = "none" and no OTLP endpoint, nothing would ever record a call.
+# path = "none"
+# fail_mode = "closed_all"

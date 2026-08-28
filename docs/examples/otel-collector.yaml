@@ -1,0 +1,43 @@
+# Example otelcol-contrib config for ruoqa-mcp. Exercises all three OTLP
+# signals plus a filelog tail of the audit stream, all to a `debug` exporter
+# so the accepted data is visible in the collector's own output.
+
+receivers:
+  # http/protobuf only -- this crate never speaks OTLP/gRPC.
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Tails the audit JSONL file directly, independent of whether the audit
+  # stream is also bridged over OTLP by ruoqa-mcp itself. Filter on
+  # `ruoqa.stream == "audit"` in a real pipeline to distinguish this from the
+  # `audit` records the otlp receiver above already carries when the audit
+  # stream is OTLP-bridged too.
+  filelog:
+    include:
+      - /var/lib/ruoqa-mcp/audit.jsonl
+    start_at: end
+
+exporters:
+  # Prints every accepted record/span/metric to the collector's stdout.
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    # Diagnostics logs (ruoqa.stream = diagnostics) and, when
+    # --audit-config is set, the OTLP-bridged audit copy
+    # (ruoqa.stream = audit) both arrive here from the otlp receiver;
+    # filelog contributes the same audit records read straight off disk.
+    logs:
+      receivers: [otlp, filelog]
+      exporters: [debug]
+    # mcp.tool/<name> spans and their openqa.request children.
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    # ruoqa.tool.calls / ruoqa.tool.duration.
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
