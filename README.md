@@ -354,8 +354,8 @@ authentication is mandatory and deny-by-default. Two tokens define two scopes:
 
 | Token | Scope | Tools |
 | --- | --- | --- |
-| `OPENQA_MCP_HTTP_TOKEN` | write | all 43 read + mutating tools |
-| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 29 read tools only |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 44 read + mutating tools |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 30 read tools only |
 
 Either may be set alone. A read-scope caller sees only the read tools in
 `tools/list` and gets an MCP error — with no openQA request made — if it calls a
@@ -416,6 +416,7 @@ ruoqa-mcp --transport http --server 0.0.0.0 --allowed-host mcp.example.com:8000
 | `--allowed-host` | *(none)* | Extra authority accepted in the `Host` header; repeatable. |
 | `--insecure-no-auth` | off | Serve HTTP with no authentication at all; prints a warning on start. |
 | `--readonly` | off | Unregister all mutating tools (read-only server). |
+| `--audit-config` | *(none)* | Path to the audit-stream TOML file; auditing is off when unset. See [Observability](#observability). |
 | `--version` | — | Print version and exit. |
 
 Flags override the environment, which supplies the defaults (and which
@@ -430,6 +431,7 @@ Flags override the environment, which supplies the defaults (and which
 | `OPENQA_MCP_HTTP_READ_TOKEN` | *(unset)* | Bearer token granting the read scope. |
 | `OPENQA_MCP_ALLOWED_HOSTS` | *(unset)* | Comma-separated default for `--allowed-host`. |
 | `OPENQA_READONLY` | `false` | Set truthy (`1`/`true`/`yes`/`on`) to disable mutating tools. |
+| `OPENQA_MCP_AUDIT_CONFIG` | *(unset)* | Default for `--audit-config`. |
 | `OPENQA_MCP_HEARTBEAT_INTERVAL` | `15.0` | Seconds between progress "heartbeat" pings sent while a tool waits on a slow openQA call, so MCP clients see liveness instead of timing out. Set `<=0` to disable. Pings are a no-op unless the client sent a `progressToken`. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 
 `--readonly` and the read token are different levers: `--readonly` is
@@ -476,6 +478,10 @@ Gotchas specific to the image:
              -e OPENQA_MCP_HTTP_TOKEN=... -p 8000:8000 \
              ghcr.io/mimi1vx/ruoqa-mcp
   ```
+- **Auditing needs a writable volume.** The image ships `/var/lib/ruoqa-mcp`
+  owned by `nonroot` (uid 65532) for the audit file; mount a volume there
+  alongside the audit-config file. A *named* volume inherits that ownership,
+  a *bind* mount needs the host directory owned by 65532 already.
 - **`OPENQA_VERIFY=/path/ca.pem` replaces the platform trust store**, it does
   not merge with it — mount the CA bundle read-only alongside `client.conf`
   and point the variable at the in-container path:
