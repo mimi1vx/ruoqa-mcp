@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.4.0...v0.5.0) - 2026-08-30
+
+### Added
+
+- add a fail-closed gate for the audit stream
+- export a metrics signal over OTLP/HTTP
+- export a traces signal over OTLP/HTTP and correlate it with logs
+- emit tracing diagnostics and bridge the audit stream over OTLP
+- resolve OTEL_* env and export logs over OTLP/HTTP
+- add a pure-std OTLP protobuf wire writer (otel::proto)
+- add --transport, deprecate --http/--stdio
+- add a JSONL audit stream for every tool call
+
+### Fixed
+
+- collapse nullable-union tool schemas for Gemini/Vertex compat
+- clear clippy warnings surfaced by CI's floating toolchain
+
+### Other
+
+- realign the README with the audit-stream and tool registry
+- document the audit stream and OTLP export, add examples and container wiring
+- *(deps)* [**breaking**] bump ruoqa to 0.3.0
+- *(deps)* refresh the lockfile
+
 ## [0.4.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.3.2...v0.4.0) - 2026-08-19
 
 ### Added
