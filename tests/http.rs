@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::http::request::Parts;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::StreamableHttpServerConfig;
@@ -34,8 +34,8 @@ struct Marker;
 struct Spy;
 
 impl ServerHandler for Spy {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     fn list_tools(
