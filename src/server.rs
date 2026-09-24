@@ -699,8 +699,7 @@ mod tests {
             }
         }
 
-        let bogus: rmcp::model::ProtocolVersion =
-            serde_json::from_str(r#""1999-01-01""#).unwrap();
+        let bogus: rmcp::model::ProtocolVersion = serde_json::from_str(r#""1999-01-01""#).unwrap();
         let mut params = InitializeRequestParams::new(
             ClientCapabilities::default(),
             Implementation::new("test-client", "0.0.0"),

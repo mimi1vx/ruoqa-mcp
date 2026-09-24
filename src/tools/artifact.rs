@@ -1021,9 +1021,10 @@ pub(crate) fn parse_downloads(html: &str, job_id: i64) -> Vec<LogFile> {
 /// `logs`/`ulogs` from `GET /api/v1/jobs/<id>/details`, the fallback source
 /// when `downloads_ajax` is unavailable or its parse comes back empty.
 pub(crate) fn details_logs(value: &serde_json::Value) -> Vec<LogFile> {
+    let job = value.get("job").unwrap_or(value);
     let mut files = Vec::new();
     for (key, kind) in [("logs", "result"), ("ulogs", "ulog")] {
-        if let Some(arr) = value.get(key).and_then(serde_json::Value::as_array) {
+        if let Some(arr) = job.get(key).and_then(serde_json::Value::as_array) {
             for v in arr {
                 if let Some(name) = v.as_str() {
                     files.push(LogFile {
@@ -1191,15 +1192,28 @@ mod tests {
     }
 
     #[test]
-    fn details_logs_reads_logs_and_ulogs_arrays() {
+    fn details_logs_reads_logs_and_ulogs_arrays_under_the_job_wrapper() {
         let value = serde_json::json!({
-            "logs": ["autoinst-log.txt", "y2logs.tar.xz"],
-            "ulogs": ["my_custom.log"],
+            "job": {
+                "logs": ["autoinst-log.txt", "y2logs.tar.xz"],
+                "ulogs": ["my_custom.log"],
+            },
         });
         let files = details_logs(&value);
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].kind, "result");
         assert_eq!(files[2].kind, "ulog");
+    }
+
+    #[test]
+    fn details_logs_also_tolerates_a_bare_shape() {
+        let value = serde_json::json!({
+            "logs": ["autoinst-log.txt"],
+            "ulogs": [],
+        });
+        let files = details_logs(&value);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].kind, "result");
     }
 
     #[test]
