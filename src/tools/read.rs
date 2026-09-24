@@ -103,6 +103,22 @@ pub struct JobId {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetJob {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
+    pub job_id: i64,
+    /// Include the job's restart-chain ancestors (jobs it restarted) and
+    /// their counts. Ignored by older openQA servers.
+    #[serde(default)]
+    pub ancestors: Option<bool>,
+    /// Include the job's restart-chain descendants (jobs that restarted it)
+    /// and their counts. Ignored by older openQA servers.
+    #[serde(default)]
+    pub descendants: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindJobsBySetting {
     /// Which configured openQA server to query. Call `list_servers` to
     /// discover valid values (including aliases like `osd`/`o3`).
@@ -226,6 +242,20 @@ pub struct ServerOnly {
     /// Which configured openQA server to query. Call `list_servers` to
     /// discover valid values (including aliases like `osd`/`o3`).
     pub server: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListWorkers {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
+    /// Filter to workers with (`true`) or without (`false`) a reservation.
+    #[serde(default)]
+    pub reserved: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -358,14 +388,20 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn get_job(
         &self,
-        Parameters(JobId { server, job_id }): Parameters<JobId>,
+        Parameters(GetJob {
+            server,
+            job_id,
+            ancestors,
+            descendants,
+        }): Parameters<GetJob>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = self.resolve_server(&server)?;
-        to_result(
-            self.request_json(&ctx, client, Method::GET, &api(&format!("jobs/{job_id}")))
-                .await,
-        )
+        let path = Query::new()
+            .push("ancestors", ancestors.and_then(|b| b.then_some(1)))
+            .push("descendants", descendants.and_then(|b| b.then_some(1)))
+            .finish(&api(&format!("jobs/{job_id}")));
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(
@@ -660,14 +696,21 @@ data, save it to a temporary file and process it with jq, e.g. `jq '.jobs[] | se
     )]
     async fn list_workers(
         &self,
-        Parameters(ServerOnly { server }): Parameters<ServerOnly>,
+        Parameters(ListWorkers {
+            server,
+            reserved,
+            limit,
+            offset,
+        }): Parameters<ListWorkers>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = self.resolve_server(&server)?;
-        to_result(
-            self.request_json(&ctx, client, Method::GET, &api("workers"))
-                .await,
-        )
+        let path = Query::new()
+            .push("reserved", reserved.map(i64::from))
+            .push("limit", limit)
+            .push("offset", offset)
+            .finish(&api("workers"));
+        to_result(self.request_json(&ctx, client, Method::GET, &path).await)
     }
 
     #[tool(
