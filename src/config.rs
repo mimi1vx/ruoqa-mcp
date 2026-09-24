@@ -156,6 +156,9 @@ pub struct EnvConfig {
     /// Same as `api_key_set`, for `$OPENQA_API_SECRET` /
     /// `ruoqa::config::API_SECRET_ENV`.
     pub api_secret_set: bool,
+    /// `$OPENQA_USERNAME`, non-empty. Switches the client from HMAC signing
+    /// to `Authorization: Bearer <username>:<key>:<secret>`.
+    pub username: Option<String>,
 }
 
 impl EnvConfig {
@@ -168,6 +171,9 @@ impl EnvConfig {
             config_paths: None,
             api_key_set: std::env::var("OPENQA_API_KEY").is_ok_and(|v| !v.is_empty()),
             api_secret_set: std::env::var("OPENQA_API_SECRET").is_ok_and(|v| !v.is_empty()),
+            username: std::env::var("OPENQA_USERNAME")
+                .ok()
+                .filter(|v| !v.is_empty()),
         }
     }
 }
@@ -198,6 +204,9 @@ pub(crate) fn build_one(env: &EnvConfig, server: &str) -> Result<Client> {
         .timeouts(timeouts);
     if let Some(paths) = env.config_paths.clone() {
         builder = builder.config_paths(paths);
+    }
+    if let Some(username) = &env.username {
+        builder = builder.username(ruoqa::secret::Username::new(username.as_str()));
     }
     builder.build()
 }
@@ -313,9 +322,77 @@ mod tests {
             config_paths: Some(vec![]), // never touch the developer's real client.conf
             api_key_set: false,
             api_secret_set: false,
+            username: None,
         };
         let client = build_client(&env).unwrap();
         assert_eq!(client.base_url().host_str(), Some("openqa.example.com"));
+    }
+
+    #[tokio::test]
+    async fn username_sends_bearer_and_no_hmac_headers() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/jobs"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&mock)
+            .await;
+
+        // A `client.conf` section keyed by the mock's authority, so the
+        // key/secret come from config rather than mutating process-wide env
+        // vars another test in this binary might race on.
+        let authority = mock.uri().trim_start_matches("http://").to_string();
+        let conf = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            conf.path(),
+            format!("[{authority}]\nkey = KEY\nsecret = SECRET\n"),
+        )
+        .unwrap();
+
+        let env = EnvConfig {
+            server: Some(mock.uri()), // http://127.0.0.1:<port>, loopback
+            verify: None,
+            timeout: None,
+            config_paths: Some(vec![conf.path().to_path_buf()]),
+            api_key_set: false,
+            api_secret_set: false,
+            username: Some("alice".to_string()),
+        };
+        let client = build_client(&env).unwrap();
+        client
+            .request(reqwest::Method::GET, "/api/v1/jobs", None)
+            .await
+            .expect("request should succeed");
+
+        let received = mock.received_requests().await.unwrap();
+        let req = &received[0];
+        assert_eq!(
+            req.headers.get("authorization").unwrap(),
+            "Bearer alice:KEY:SECRET"
+        );
+        assert!(!req.headers.contains_key("x-api-key"));
+        assert!(!req.headers.contains_key("x-api-hash"));
+        assert!(!req.headers.contains_key("x-api-microtime"));
+    }
+
+    #[test]
+    fn username_without_a_key_and_secret_fails_incomplete_credentials() {
+        let env = EnvConfig {
+            server: Some("openqa.example.com".to_string()),
+            verify: None,
+            timeout: None,
+            config_paths: Some(vec![]), // never touch the developer's real client.conf
+            api_key_set: false,
+            api_secret_set: false,
+            username: Some("alice".to_string()),
+        };
+        let err = build_client(&env).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::IncompleteCredentials {
+                present: "username",
+                ..
+            }
+        ));
     }
 
     #[test]
