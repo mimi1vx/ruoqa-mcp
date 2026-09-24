@@ -1663,6 +1663,52 @@ async fn get_job_log_errors_falls_back_to_test_died_without_a_serial_log() {
         hits.iter()
             .any(|h| h["text"].as_str().unwrap().contains("Test died"))
     );
+    // Old-format regression: no `[step:` line and no `--- # stack trace`
+    // means no fabricated `location`.
+    assert!(value.get("location").is_none());
+}
+
+#[tokio::test]
+async fn get_job_log_errors_test_died_reports_step_and_stack_location() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/29/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["autoinst-log.txt"], "testresults": []}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/29/file/autoinst-log.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "[2026-09-24T10:00:00.000000+02:00] [debug] [pid:100] \
+             [step:consoletest,zypper_ref,5] tests/console/zypper_ref.pm:19 called \
+             testapi::assert_script_run -> main::run(...)\n\
+             [2026-09-24T10:00:00.100000+02:00] [info] [pid:100] ::: main::run: # Test died: \
+             'zypper -n ref' failed with code 4\n  --- # stack trace\n  main::run(...) called at \
+             tests/console/zypper_ref.pm line 19\n  OpenQA::Test::RunArgs::run(...) called at \
+             /usr/lib/os-autoinst/autotest.pm line 65\n\
+             [2026-09-24T10:00:00.200000+02:00] [debug] [pid:100] some other debug line after\n",
+        ))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(&client, "get_job_log_errors", json!({"job_id": 29}))
+        .await
+        .expect("call_tool");
+    let value = text(&result);
+
+    assert_eq!(value["tier"], "test_died");
+    let step = value["location"]["step"].as_str().unwrap();
+    assert!(step.contains("[step:consoletest,zypper_ref,5]"));
+    let stack = value["location"]["stack"].as_array().unwrap();
+    assert!(
+        stack[0]
+            .as_str()
+            .unwrap()
+            .contains("tests/console/zypper_ref.pm line 19")
+    );
 }
 
 #[tokio::test]

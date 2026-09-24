@@ -28,7 +28,9 @@ use serde_json::Value;
 
 use crate::error::{classify, status_kind, tool_error};
 use crate::heartbeat::with_heartbeat;
-use crate::tools::{DIGEST_MAX_LINE_CHARS, DIGEST_MAX_MODULES, PROBE_BYTES};
+use crate::tools::{
+    DIGEST_MAX_LINE_CHARS, DIGEST_MAX_MODULES, DIGEST_MAX_STACK_FRAMES, PROBE_BYTES,
+};
 
 /// Bytes assumed per log line when sizing a tail read. Generous relative to
 /// a typical openQA log line, so a `tail_lines` request rarely needs the
@@ -874,6 +876,62 @@ pub(crate) fn tail_hits(text: &str, n: usize) -> Vec<MatchHit> {
         .collect()
 }
 
+/// A log line os-autoinst itself writes, always opening with a
+/// `Time::Moment` ISO-8601 timestamp (`log.pm`'s `log_format_callback`):
+/// `[2026-09-24T10:00:00.000000+02:00] [level] [pid:N] ...`. Used as the
+/// "next real log line" stop condition when collecting a die's stack trace,
+/// whose frames have no such prefix.
+static TIMESTAMPED_LOG_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[\d{4}-\d{2}-\d{2}T").expect("static regex"));
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiedContext {
+    /// The last `[step:<category>,<name>,<n>] <file>:<line> called ...` debug
+    /// line (`bmwqemu.pm`'s `update_line_number`) before the hit — the step
+    /// that was running when the module died.
+    pub(crate) step: Option<String>,
+    /// The `--- # stack trace` frames `basetest.pm` appends to the die
+    /// message itself, so they follow the hit line directly.
+    pub(crate) stack: Vec<String>,
+}
+
+/// Best-effort context around a `FATAL_MARKERS` hit at `hit_line` (1-based,
+/// as in [`MatchHit::line`]): the step that was executing, and the stack
+/// trace `basetest.pm` attaches to a real `Test died`. Both are optional —
+/// a job with reduced log verbosity may have neither — and `None` overall
+/// when it has neither.
+pub(crate) fn died_context(text: &str, hit_line: usize) -> Option<DiedContext> {
+    let lines: Vec<&str> = text.lines().collect();
+    if hit_line == 0 || hit_line > lines.len() {
+        return None;
+    }
+    let hit_idx = hit_line - 1;
+
+    let step = lines[..hit_idx]
+        .iter()
+        .rev()
+        .find(|l| l.contains("[step:"))
+        .map(|l| truncate_line(l, DIGEST_MAX_LINE_CHARS));
+
+    let stack: Vec<String> = lines[hit_idx..]
+        .iter()
+        .position(|l| l.contains("--- # stack trace"))
+        .map(|offset| {
+            lines[hit_idx + offset + 1..]
+                .iter()
+                .take_while(|l| !TIMESTAMPED_LOG_LINE.is_match(l))
+                .take(DIGEST_MAX_STACK_FRAMES)
+                .map(|l| (*l).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if step.is_none() && stack.is_empty() {
+        return None;
+    }
+    Some(DiedContext { step, stack })
+}
+
 /// GET, decode (gzip/xz transparently; a tar is refused, same message
 /// `get_job_log` gives), and lossily decode as UTF-8 — `serial_terminal.txt`
 /// is raw console output that routinely carries stray non-UTF-8 bytes,
@@ -1311,6 +1369,56 @@ mod tests {
         // a graceful shutdown. Neither is a failure signal.
         assert!(!FATAL_MARKERS.is_match("[info] [pid:1] Result: done"));
         assert!(!FATAL_MARKERS.is_match("[info] [pid:1] Result: finish-off"));
+    }
+
+    /// Mirrors `bmwqemu.pm:260`'s `[step:...]` debug line and
+    /// `basetest.pm:364-366`'s `--- # stack trace` appended to a real
+    /// `Test died` message.
+    fn died_fixture() -> &'static str {
+        "[2026-09-24T10:00:00.000000+02:00] [debug] [pid:100] [step:consoletest,zypper_ref,5] \
+         tests/console/zypper_ref.pm:19 called testapi::assert_script_run -> main::run(...)\n\
+         [2026-09-24T10:00:00.100000+02:00] [info] [pid:100] ::: main::run: # Test died: 'zypper \
+         -n ref' failed with code 4\n  --- # stack trace\n  main::run(...) called at \
+         tests/console/zypper_ref.pm line 19\n  OpenQA::Test::RunArgs::run(...) called at \
+         /usr/lib/os-autoinst/autotest.pm line 65\n\
+         [2026-09-24T10:00:00.200000+02:00] [debug] [pid:100] some other debug line after\n"
+    }
+
+    #[test]
+    fn died_context_finds_the_step_before_and_the_stack_after() {
+        let text = died_fixture();
+        let hit_line = text.lines().position(|l| l.contains("Test died")).unwrap() + 1;
+        let context = died_context(text, hit_line).unwrap();
+        assert!(
+            context
+                .step
+                .unwrap()
+                .contains("[step:consoletest,zypper_ref,5]")
+        );
+        assert_eq!(context.stack.len(), 2);
+        assert!(context.stack[0].contains("tests/console/zypper_ref.pm line 19"));
+    }
+
+    #[test]
+    fn died_context_stops_at_the_next_timestamped_log_line() {
+        let text = died_fixture();
+        let hit_line = text.lines().position(|l| l.contains("Test died")).unwrap() + 1;
+        let context = died_context(text, hit_line).unwrap();
+        assert!(
+            context
+                .stack
+                .iter()
+                .all(|l| !l.contains("some other debug line"))
+        );
+    }
+
+    #[test]
+    fn died_context_is_none_for_the_old_format_with_no_step_or_stack() {
+        // Regression: a log with only the bare "# Test died: ..." line (no
+        // `[step:` before it, no `--- # stack trace` after it) must not
+        // fabricate a `location`.
+        let text = "before\n# Test died: oops\nafter\n";
+        assert!(died_context(text, 2).is_none());
     }
 
     #[test]

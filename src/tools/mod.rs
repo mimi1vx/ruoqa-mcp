@@ -41,6 +41,9 @@ pub(crate) const DIGEST_MAX_LINE_CHARS: usize = 300;
 /// reports, so a job with a huge number of failures can't produce an
 /// unbounded reply.
 pub(crate) const DIGEST_MAX_MODULES: usize = 10;
+/// `get_job_log_errors`: cap on how many `--- # stack trace` frames
+/// `died_context` reports.
+pub(crate) const DIGEST_MAX_STACK_FRAMES: usize = 10;
 
 /// Reject `len` outside `[min, max]` with a message naming `field`, the
 /// observed count, and the limit that was crossed.
