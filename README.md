@@ -47,6 +47,7 @@ to the openQA client config file for credentials.
 | `OPENQA_SERVER` | *(unset)* | openQA host(s) (e.g. `openqa.opensuse.org`), or a comma-separated list to talk to several at once (e.g. `openqa.suse.de,openqa.opensuse.org`). Empty falls back to ruoqa's `client.conf` discovery. |
 | `OPENQA_API_KEY` | *(unset)* | API key, read by `ruoqa` itself; overrides the config file when set. Only valid with a single configured server — see below. |
 | `OPENQA_API_SECRET` | *(unset)* | API secret, read by `ruoqa` itself; overrides the config file when set. Only valid with a single configured server — see below. |
+| `OPENQA_USERNAME` | *(unset)* | openQA username; switches from HMAC signing to personal-access-token (Bearer) auth, sending `Authorization: Bearer <username>:<key>:<secret>` instead of `X-API-*` headers. Requires `OPENQA_API_KEY`/`OPENQA_API_SECRET` (or a matching `client.conf` section). Only valid with a single configured server. Rejected over plaintext `http://` to a non-loopback host. |
 | `OPENQA_VERIFY` | `true` | TLS verification: `true`/`false`, or a path to a PEM CA bundle. See the warning below before using `false`. |
 | `OPENQA_MCP_TIMEOUT` | `30.0` | Per-request HTTP timeout (seconds) for openQA calls; raise for slow queries like large `latest=1` failed-job lists. `<=0` disables the timeout. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
 | `OPENQA_MCP_CALL_TIMEOUT` | `300.0` | Whole-tool-call deadline (seconds), independent of `OPENQA_MCP_TIMEOUT`; bounds a slow upstream regardless of which tool is waiting on it. `<=0` disables it. Empty/unset uses the default; unparseable, `NaN`, infinite, or out-of-range values abort startup. |
@@ -56,7 +57,9 @@ only one is a startup error. With 2 or more servers configured in
 `OPENQA_SERVER`, setting either at all is also a startup error: there is no
 way for a process-wide env var to apply to only some of the servers, so
 multi-server credentials must live in `client.conf`'s per-`[host]` sections
-instead (see [Config file](#config-file)).
+instead (see [Config file](#config-file)). The same rule applies to
+`OPENQA_USERNAME`: there is no per-host syntax for it yet, so it too is a
+startup error with 2 or more configured servers.
 
 Every tool call takes a mandatory `server` argument naming which configured
 server to use — `openqa.suse.de` and `openqa.opensuse.org` are additionally
@@ -145,7 +148,7 @@ descriptions for brevity) — see [Environment variables](#environment-variables
 | `list_servers` | List the openQA servers this MCP instance is configured to talk to. Takes no other arguments. |
 | `list_jobs` | List jobs matching the given filters. Pass `summary=true` for a compact triage breakdown. |
 | `list_jobs_overview` | List a condensed jobs overview matching the given filters. Pass `summary=true` for a compact triage breakdown. |
-| `get_job` | Get full details for a single job. |
+| `get_job` | Get full details for a single job. Optional `ancestors`/`descendants` (bool) add the job's restart-chain counts; sent as `?ancestors=1`/`?descendants=1` only when `true`, ignored by older openQA servers. |
 | `get_job_comments` | List comments on a job. |
 | `list_machines` | List configured worker machines. |
 | `list_test_suites` | List configured test suites. |
@@ -161,7 +164,7 @@ descriptions for brevity) — see [Environment variables](#environment-variables
 | `get_parent_group` | Get a single parent job group. |
 | `list_assets` | List assets known to the system. |
 | `get_asset` | Get a single asset by id. |
-| `list_workers` | List registered worker instances. |
+| `list_workers` | List registered worker instances. Optional `reserved` (bool, sent as `0`/`1`), `limit`, `offset`. |
 | `list_bugs` | List tracked bugs referenced by jobs. |
 | `search` | Full-text search across jobs, groups, and test modules. |
 | `get_scheduled_product` | Get a scheduled product (result of a prior ISO trigger). |
@@ -171,7 +174,7 @@ descriptions for brevity) — see [Environment variables](#environment-variables
 | `list_job_logs` | List a job's downloadable log files and uploaded (ulog) files. |
 | `list_job_log_members` | List the members of a job log archive (tar, tar.gz, tar.xz). |
 | `get_job_log` | Read a job log or uploaded file, optionally tailed, grepped, or extracted from an archive. |
-| `get_job_log_errors` | Digest a job's logs down to the failure signal: the first matching tier of `serial_terminal.txt` TFAIL/TBROK, `autoinst-log.txt` "Test died", a generic fallback, or the tail — plus the failing module(s) with `#step` deep links. |
+| `get_job_log_errors` | Digest a job's logs down to the failure signal: the first matching tier of `serial_terminal.txt` TFAIL/TBROK, `autoinst-log.txt` "Test died", a generic fallback, or the tail — plus the failing module(s) with `#step` deep links, and (`test_died` tier only) a `location` with the running step and any stack trace. |
 
 `list_jobs` and `list_jobs_overview` accept the same optional filters:
 `state`, `result`, `distri`, `version`, `build`, `test`, `arch`, `machine`,
@@ -244,7 +247,12 @@ for. Pass `markers` (a list of regexes) to scan `filename` (default
 `autoinst-log.txt`) for something else entirely instead of the tier chain.
 The tool also fetches `/api/v1/jobs/<id>/details` (up to ~14 MB,
 best-effort) for the `failed_modules` step deep links; a failed fetch just
-means that field is omitted, never an aborted digest.
+means that field is omitted, never an aborted digest. On the `test_died`
+tier, a reply also carries `location` when the log has it: `step` (the last
+`[step:<category>,<name>,<n>]` debug line before the failure) and `stack`
+(the `--- # stack trace` frames os-autoinst appends to the die message,
+capped at 10 frames). Older or less verbose logs have neither, and
+`location` is omitted rather than sent empty.
 
 ### Mutating tools (require credentials)
 
