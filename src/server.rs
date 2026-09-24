@@ -8,8 +8,8 @@ use reqwest::Method;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ResultType,
-    ServerCapabilities, ServerConfig, Tool,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ResultType, ServerCapabilities,
+    ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
@@ -466,21 +466,6 @@ fn session_of(context: &RequestContext<RoleServer>, process_session: &str) -> St
         .map_or_else(|| process_session.to_string(), str::to_string)
 }
 
-/// [`rmcp::service::negotiate_protocol_version`]'s body (`rmcp` 3.1.3 keeps it
-/// crate-private): echo the client's requested version if this server
-/// supports it, else fall back to the server's own default.
-fn negotiate_protocol_version(
-    client_requested: &ProtocolVersion,
-    server_fallback: ProtocolVersion,
-    server_supported: &[ProtocolVersion],
-) -> ProtocolVersion {
-    if server_supported.contains(client_requested) {
-        client_requested.clone()
-    } else {
-        server_fallback
-    }
-}
-
 /// Extract an [`Outcome`] from a tool call's result, per the classification
 /// table: a completed call with `is_error == Some(true)` reads back
 /// `error.rs::tool_error`'s own JSON shape (`kind`/`status`), an
@@ -524,8 +509,8 @@ impl ServerHandler for OpenQaServer {
             .with_instructions(INSTRUCTIONS)
     }
 
-    /// The default impl's body (`rmcp` 3.1.3), plus a `session_open` audit
-    /// record. Copied rather than delegated to `get_info()` alone, or
+    /// The default impl's body, plus a `session_open` audit record on
+    /// success. Copied rather than delegated to `get_info()` alone, or
     /// protocol-version negotiation silently regresses: there is no
     /// `Mcp-Session-Id` yet at this point, so the record uses the
     /// per-process session id even over HTTP.
@@ -536,16 +521,13 @@ impl ServerHandler for OpenQaServer {
     ) -> impl Future<Output = Result<InitializeResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
     {
         context.peer.set_peer_info(request.clone());
-        let mut info = self.get_info();
-        info.protocol_version = negotiate_protocol_version(
-            &request.protocol_version,
-            info.protocol_version,
-            &self.supported_protocol_versions(),
-        );
-        if let Some(audit) = &self.audit {
+        let result = self.negotiate_initialize(&request);
+        if result.is_ok()
+            && let Some(audit) = &self.audit
+        {
             audit.session_open(audit.process_session(), self.transport);
         }
-        std::future::ready(Ok(info))
+        std::future::ready(result)
     }
 
     /// The macro's body, gated on the caller's scope, always producing a
@@ -701,6 +683,38 @@ impl ServerHandler for OpenQaServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `initialize` now delegates its version negotiation to
+    /// `negotiate_initialize`, so a bogus protocol version must be handled
+    /// exactly as a bare default `ServerHandler` would handle it.
+    #[test]
+    fn initialize_negotiates_a_bogus_version_like_the_default_handler() {
+        use rmcp::model::{ClientCapabilities, Implementation};
+
+        #[derive(Clone, Default)]
+        struct DefaultServer;
+        impl ServerHandler for DefaultServer {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::default()
+            }
+        }
+
+        let bogus: rmcp::model::ProtocolVersion =
+            serde_json::from_str(r#""1999-01-01""#).unwrap();
+        let mut params = InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new("test-client", "0.0.0"),
+        );
+        params.protocol_version = bogus;
+
+        let ours = OpenQaServer::new(fixture_registry(), false)
+            .negotiate_initialize(&params)
+            .expect("a bogus version should fall back rather than fail");
+        let theirs = DefaultServer
+            .negotiate_initialize(&params)
+            .expect("a bogus version should fall back rather than fail");
+        assert_eq!(ours.protocol_version, theirs.protocol_version);
+    }
 
     #[test]
     fn ok_normalizes_null_to_empty_object() {
