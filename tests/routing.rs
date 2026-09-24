@@ -95,6 +95,14 @@ fn cases() -> Vec<Case> {
             body: None,
         },
         Case {
+            tool: "get_job",
+            args: json!({"job_id": 7, "ancestors": true, "descendants": false}),
+            method: "GET",
+            path: "/api/v1/jobs/7",
+            query: "ancestors=1",
+            body: None,
+        },
+        Case {
             tool: "get_job_comments",
             args: json!({"job_id": 7}),
             method: "GET",
@@ -226,6 +234,14 @@ fn cases() -> Vec<Case> {
             method: "GET",
             path: "/api/v1/workers",
             query: "",
+            body: None,
+        },
+        Case {
+            tool: "list_workers",
+            args: json!({"reserved": true, "limit": 50, "offset": 10}),
+            method: "GET",
+            path: "/api/v1/workers",
+            query: "reserved=1&limit=50&offset=10",
             body: None,
         },
         Case {
