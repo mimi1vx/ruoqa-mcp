@@ -1524,8 +1524,10 @@ async fn list_job_logs_falls_back_to_details_on_404() {
     Mock::given(method("GET"))
         .and(path("/api/v1/jobs/12/details"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "logs": ["autoinst-log.txt"],
-            "ulogs": ["my_custom.log"],
+            "job": {
+                "logs": ["autoinst-log.txt"],
+                "ulogs": ["my_custom.log"],
+            },
         })))
         .mount(&mock)
         .await;
@@ -1551,9 +1553,9 @@ async fn list_job_logs_falls_back_to_details_when_ajax_parse_is_empty() {
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/jobs/13/details"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"logs": ["a.txt"], "ulogs": []})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"logs": ["a.txt"], "ulogs": []},
+        })))
         .mount(&mock)
         .await;
     let client = server_with_mock(&mock, true).await;
