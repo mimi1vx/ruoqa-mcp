@@ -94,6 +94,8 @@ impl ServerRegistry {
 pub enum ServerConfigError {
     /// `$OPENQA_API_KEY`/`$OPENQA_API_SECRET` set with 2+ servers configured.
     AmbiguousCredentials,
+    /// `$OPENQA_USERNAME` set with 2+ servers configured.
+    AmbiguousUsername,
     /// Two entries (or an entry and an alias) resolved to the same id.
     DuplicateServerId(String),
     /// One entry's `ClientBuilder::build()` failed.
@@ -110,6 +112,11 @@ impl fmt::Display for ServerConfigError {
                 f,
                 "OPENQA_API_KEY/OPENQA_API_SECRET cannot be set when 2 or more servers are \
                  configured in OPENQA_SERVER; put per-host credentials in client.conf instead"
+            ),
+            Self::AmbiguousUsername => write!(
+                f,
+                "OPENQA_USERNAME cannot be set when 2 or more servers are configured in \
+                 OPENQA_SERVER; there is no per-host syntax for it yet"
             ),
             Self::DuplicateServerId(id) => {
                 write!(f, "two configured servers both resolve to {id:?}")
@@ -128,7 +135,9 @@ impl std::error::Error for ServerConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Client { source, .. } => Some(source),
-            Self::AmbiguousCredentials | Self::DuplicateServerId(_) => None,
+            Self::AmbiguousCredentials | Self::AmbiguousUsername | Self::DuplicateServerId(_) => {
+                None
+            }
         }
     }
 }
@@ -139,13 +148,18 @@ impl std::error::Error for ServerConfigError {
 ///
 /// Returns [`ServerConfigError::AmbiguousCredentials`] if 2+ servers are
 /// configured alongside `$OPENQA_API_KEY`/`$OPENQA_API_SECRET`,
-/// [`ServerConfigError::DuplicateServerId`] if two entries (or an entry and
-/// an alias) resolve to the same id, or [`ServerConfigError::Client`] if any
-/// entry's `ClientBuilder::build()` fails.
+/// [`ServerConfigError::AmbiguousUsername`] if 2+ servers are configured
+/// alongside `$OPENQA_USERNAME`, [`ServerConfigError::DuplicateServerId`] if
+/// two entries (or an entry and an alias) resolve to the same id, or
+/// [`ServerConfigError::Client`] if any entry's `ClientBuilder::build()`
+/// fails.
 pub fn build_registry(env: &EnvConfig) -> std::result::Result<ServerRegistry, ServerConfigError> {
     let entries = split_servers(env.server.as_deref());
     if entries.len() > 1 && (env.api_key_set || env.api_secret_set) {
         return Err(ServerConfigError::AmbiguousCredentials);
+    }
+    if entries.len() > 1 && env.username.is_some() {
+        return Err(ServerConfigError::AmbiguousUsername);
     }
     let mut clients = HashMap::new();
     for server in &entries {
@@ -259,6 +273,7 @@ mod tests {
             config_paths: Some(vec![]), // never touch the developer's real client.conf
             api_key_set: false,
             api_secret_set: false,
+            username: None,
         }
     }
 
@@ -329,6 +344,16 @@ mod tests {
         e.api_key_set = true;
         e.api_secret_set = true;
         assert!(build_registry(&e).is_ok());
+    }
+
+    #[test]
+    fn multiple_servers_with_username_set_is_ambiguous() {
+        let mut e = env("openqa.suse.de,openqa.opensuse.org");
+        e.username = Some("alice".to_string());
+        assert!(matches!(
+            build_registry(&e).unwrap_err(),
+            ServerConfigError::AmbiguousUsername
+        ));
     }
 
     #[test]
