@@ -57,6 +57,9 @@ pub struct TriggerIsos {
     pub version: String,
     pub flavor: String,
     pub arch: String,
+    /// Extra POST parameters, e.g. `BUILD`, `TEST`, or
+    /// `_FAIL_IF_NO_JOBS=1` (return 400 instead of an empty success when no
+    /// jobs are scheduled; ignored when `async` is set).
     #[serde(default)]
     #[schemars(extend("maxProperties" = MAX_EXTRA_ENTRIES))]
     pub extra: Option<HashMap<String, String>>,
@@ -660,5 +663,11 @@ mod tests {
         assert!(path_segment("").is_err());
         assert!(path_segment(".").is_err());
         assert!(path_segment("..").is_err());
+    }
+
+    #[test]
+    fn check_extra_keys_accepts_fail_if_no_jobs() {
+        let extra = HashMap::from([("_FAIL_IF_NO_JOBS".to_string(), "1".to_string())]);
+        assert!(check_extra_keys(&extra).is_ok());
     }
 }
