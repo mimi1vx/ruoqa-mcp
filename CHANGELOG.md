@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.5.0...v0.6.0) - 2026-09-24
+
+### Added
+
+- surface os-autoinst stack traces in get_job_log_errors
+- add OPENQA_USERNAME for personal-access-token (Bearer) auth
+- add ancestors/descendants and list_workers params
+
+### Fixed
+
+- unwrap the {job:{...}} wrapper in details_logs
+- replace deprecated rmcp::model::ServerInfo with ServerConfig
+
+### Other
+
+- document OPENQA_USERNAME, get_job/list_workers params, location
+- document _FAIL_IF_NO_JOBS on trigger_isos' extra field
+- delegate initialize to rmcp's negotiate_initialize
+- *(deps)* [**breaking**] raise rmcp floor to 3.4, ruoqa floor to 0.3.2
+- *(deps)* upgrade rmcp/ruoqa MCP core
+
 ## [0.5.0](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.4.0...v0.5.0) - 2026-08-30
 
 ### Added
