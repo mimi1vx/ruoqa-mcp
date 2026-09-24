@@ -1064,7 +1064,9 @@ verdict for serial-console-driven frameworks, never duplicated into autoinst-log
 autoinst-log.txt for \"Test died\"; a generic error/timeout fallback; finally just the tail. The \
 first tier that matches wins. Pass `markers` (a list of regexes) to scan `filename` (default \
 autoinst-log.txt) for something else entirely instead of the tier chain. Also names the failing \
-test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort `/details` fetch.",
+test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort `/details` fetch. \
+The `test_died` tier adds `location` (the running step and any `--- # stack trace` frames) when \
+the log carries them.",
         annotations(read_only_hint = true)
     )]
     async fn get_job_log_errors(
@@ -1124,6 +1126,7 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
                 &scan_file,
                 &with_tail(scan, &text),
                 failed_modules,
+                None,
             );
         }
 
@@ -1157,6 +1160,7 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
                         "serial_terminal.txt",
                         &with_tail(scan, &text),
                         failed_modules,
+                        None,
                     );
                 }
             }
@@ -1177,12 +1181,20 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
             DIGEST_MAX_HITS,
         );
         if died.hit_count > 0 {
+            // `died.hits[0].line` may be a context line before the real
+            // match (`DIGEST_CONTEXT_LINES`), so find the actual first
+            // `FATAL_MARKERS` line directly instead.
+            let location = text
+                .lines()
+                .position(|l| artifact::FATAL_MARKERS.is_match(l))
+                .and_then(|idx| artifact::died_context(&text, idx + 1));
             return digest_reply(
                 job_id,
                 "test_died",
                 &scan_file,
                 &with_tail(died, &text),
                 failed_modules,
+                location,
             );
         }
 
@@ -1199,6 +1211,7 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
                 &scan_file,
                 &with_tail(generic, &text),
                 failed_modules,
+                None,
             );
         }
 
@@ -1208,7 +1221,7 @@ test module(s), each with a `#step/<module>/<num>` deep link, from a best-effort
             more_hits: false,
             total_lines: text.lines().count(),
         };
-        digest_reply(job_id, "tail", &scan_file, &scan, failed_modules)
+        digest_reply(job_id, "tail", &scan_file, &scan, failed_modules, None)
     }
 
     #[tool(
@@ -1232,13 +1245,15 @@ fn with_tail(mut scan: artifact::ScanResult, text: &str) -> artifact::ScanResult
 }
 
 /// Builds `get_job_log_errors`'s reply; `failed_modules` is omitted when the
-/// `/details` fetch failed or found no failed/softfailed module.
+/// `/details` fetch failed or found no failed/softfailed module, and
+/// `location` (the `test_died` tier's step/stack context) only when present.
 fn digest_reply(
     job_id: i64,
     tier: &str,
     source: &str,
     scan: &artifact::ScanResult,
     failed_modules: Option<Vec<artifact::FailedModule>>,
+    location: Option<artifact::DiedContext>,
 ) -> Result<CallToolResult, ErrorData> {
     let mut reply = json!({
         "job_id": job_id,
@@ -1253,6 +1268,9 @@ fn digest_reply(
         && !modules.is_empty()
     {
         reply["failed_modules"] = json!(modules);
+    }
+    if let Some(location) = location {
+        reply["location"] = json!(location);
     }
     ok(reply)
 }
