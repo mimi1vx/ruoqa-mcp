@@ -175,6 +175,7 @@ descriptions for brevity) — see [Environment variables](#environment-variables
 | `list_job_log_members` | List the members of a job log archive (tar, tar.gz, tar.xz). |
 | `get_job_log` | Read a job log or uploaded file, optionally tailed, grepped, or extracted from an archive. |
 | `get_job_log_errors` | Digest a job's logs down to the failure signal: the first matching tier of `serial_terminal.txt` TFAIL/TBROK, `autoinst-log.txt` "Test died", a generic fallback, or the tail — plus the failing module(s) with `#step` deep links, and (`test_died` tier only) a `location` with the running step and any stack trace. |
+| `get_step_needles` | Return one test step's screenshot and its best-scoring needle candidates as MCP image content, after a JSON block naming them. `module` and `step` are required (from `get_job_log_errors`' `failed_modules`); `max_candidates` (default 1, at most 3) sets how many needle images follow the screenshot. |
 
 `list_jobs` and `list_jobs_overview` accept the same optional filters:
 `state`, `result`, `distri`, `version`, `build`, `test`, `arch`, `machine`,
@@ -253,6 +254,18 @@ tier, a reply also carries `location` when the log has it: `step` (the last
 (the `--- # stack trace` frames os-autoinst appends to the die message,
 capped at 10 frames). Older or less verbose logs have neither, and
 `location` is omitted rather than sent empty.
+
+`get_step_needles` fetches `/api/v1/jobs/<id>/details`, then the step's
+screenshot (`/tests/<id>/images/<name>`) and its needle PNGs
+(`/needles/<distri>/<name>.png`), and returns them as MCP image content
+after a JSON summary whose `images` list names each block in order. The
+matched needle, if the step has one, comes first; the remaining candidates
+are ordered by mean `similarity`, then name. Each image is capped at 4 MiB.
+A needle whose image can't be fetched (e.g. deleted or renamed since the
+job ran) is reported as that candidate's `image_error` and the call still
+succeeds; a screenshot that can't be
+fetched, isn't a PNG, or is missing fails the call. Every candidate carries
+an `image_url` too, for clients that don't render images.
 
 ### Mutating tools (require credentials)
 
@@ -362,8 +375,8 @@ authentication is mandatory and deny-by-default. Two tokens define two scopes:
 
 | Token | Scope | Tools |
 | --- | --- | --- |
-| `OPENQA_MCP_HTTP_TOKEN` | write | all 44 read + mutating tools |
-| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 30 read tools only |
+| `OPENQA_MCP_HTTP_TOKEN` | write | all 45 read + mutating tools |
+| `OPENQA_MCP_HTTP_READ_TOKEN` | read | the 31 read tools only |
 
 Either may be set alone. A read-scope caller sees only the read tools in
 `tools/list` and gets an MCP error — with no openQA request made — if it calls a

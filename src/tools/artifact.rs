@@ -19,7 +19,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use regex::{Regex, RegexSet};
 use reqwest::header::{CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED, RANGE};
 use reqwest::{Method, StatusCode};
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
 use ruoqa::PreparedRequest;
@@ -93,6 +93,53 @@ fn artifact_path(job_id: i64, filename: &str) -> String {
         "/tests/{job_id}/file/{}",
         utf8_percent_encode(filename, SEGMENT)
     )
+}
+
+pub(crate) fn test_image_path(job_id: i64, filename: &str) -> String {
+    format!(
+        "/tests/{job_id}/images/{}",
+        utf8_percent_encode(filename, SEGMENT)
+    )
+}
+
+/// The needle image route, with `version` left off the query when empty.
+/// Deliberately no `jsonfile`: `/details` reports it as a bare filename,
+/// which openQA answers with a 403, while the plain route serves the needle.
+fn needle_image_path(distri: &str, name: &str, version: &str) -> String {
+    let mut path = format!(
+        "/needles/{}/{}.png",
+        utf8_percent_encode(distri, SEGMENT),
+        utf8_percent_encode(name, SEGMENT)
+    );
+    if !version.is_empty() {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("version", version)
+            .finish();
+        path.push('?');
+        path.push_str(&query);
+    }
+    path
+}
+
+pub(crate) fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+/// The human-readable message of a [`Bail`], for reporting a failure softly
+/// instead of returning it.
+pub(crate) fn bail_message(bail: Bail) -> String {
+    match bail {
+        Err(e) => e.message.into_owned(),
+        Ok(result) => result
+            .content
+            .first()
+            .and_then(|block| match block {
+                ContentBlock::Text(t) => serde_json::from_str::<Value>(&t.text).ok(),
+                _ => None,
+            })
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "request failed".to_string()),
+    }
 }
 
 /// Result of the initial `Range: bytes=0-<PROBE_BYTES-1>` request.
@@ -269,8 +316,17 @@ pub(crate) async fn fetch_all(
     filename: &str,
     ceiling: usize,
 ) -> Result<Vec<u8>, Bail> {
-    let path = artifact_path(job_id, filename);
-    let prepared = client.prepare(Method::GET, &path, None).map_err(classify)?;
+    fetch_bytes(client, ctx, &artifact_path(job_id, filename), ceiling).await
+}
+
+/// [`fetch_all`] for an arbitrary server-relative `path`.
+pub(crate) async fn fetch_bytes(
+    client: &ruoqa::Client,
+    ctx: &RequestContext<RoleServer>,
+    path: &str,
+    ceiling: usize,
+) -> Result<Vec<u8>, Bail> {
+    let prepared = client.prepare(Method::GET, path, None).map_err(classify)?;
     let mut resp = execute(client, ctx, &prepared).await?;
     check_not_bounced(&prepared, &resp)?;
     if !resp.status().is_success() {
@@ -1027,6 +1083,194 @@ pub(crate) fn failed_modules(
     modules
 }
 
+/// The step entry `details[].num == step` of the module named `module`, from
+/// a `/details` response.
+pub(crate) fn find_step<'a>(details: &'a Value, module: &str, step: u64) -> Option<&'a Value> {
+    let job = details.get("job").unwrap_or(details);
+    job.get("testresults")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("name").and_then(Value::as_str) == Some(module))?
+        .get("details")?
+        .as_array()?
+        .iter()
+        .find(|d| d.get("num").and_then(Value::as_u64) == Some(step))
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct NeedleCandidate {
+    pub(crate) name: String,
+    /// True for the needle os-autoinst actually matched on this step.
+    pub(crate) matched: bool,
+    /// Mean of the needle's `area[].similarity` (openQA reports 0-100); 0
+    /// when none are reported.
+    pub(crate) score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image_url: Option<String>,
+    #[serde(skip)]
+    pub(crate) image_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct NeedleStep {
+    pub(crate) module: String,
+    pub(crate) step: u64,
+    pub(crate) url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) screenshot: Option<String>,
+    pub(crate) screenshot_url: Option<String>,
+    /// The matched needle first, then candidates by descending score.
+    pub(crate) needles: Vec<NeedleCandidate>,
+}
+
+fn mean_similarity(area: Option<&Value>) -> f64 {
+    let (sum, count) = area
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.get("similarity").and_then(Value::as_f64))
+        .fold((0.0, 0u32), |(sum, count), sim| (sum + sim, count + 1));
+    if count == 0 {
+        0.0
+    } else {
+        sum / f64::from(count)
+    }
+}
+
+fn candidate(
+    name: &str,
+    matched: bool,
+    score: f64,
+    json: Option<&str>,
+    distri: Option<&str>,
+    version: &str,
+    base_url: &reqwest::Url,
+) -> NeedleCandidate {
+    let mut c = NeedleCandidate {
+        name: name.to_string(),
+        matched,
+        score,
+        json: json.map(str::to_string),
+        image_url: None,
+        image_path: None,
+        image_error: None,
+    };
+    match (distri, validate_filename(name)) {
+        (None, _) => c.image_error = Some("job settings carry no DISTRI".to_string()),
+        (_, Err(_)) => c.image_error = Some("needle name is not a bare filename".to_string()),
+        (Some(distri), Ok(())) => {
+            let path = needle_image_path(distri, name, version);
+            c.image_url = Some(format!("{base_url}{}", path.trim_start_matches('/')));
+            c.image_path = Some(path);
+        }
+    }
+    c
+}
+
+/// Pulls the screenshot and needle candidates out of one `/details` step
+/// entry. `DISTRI`/`VERSION` come from the job's `settings`. Errs only when
+/// the `screenshot` value is unsafe to put in a URL path.
+pub(crate) fn needle_step(
+    details: &Value,
+    step: &Value,
+    module: &str,
+    job_id: i64,
+    base_url: &reqwest::Url,
+) -> Result<NeedleStep, String> {
+    let job = details.get("job").unwrap_or(details);
+    let setting = |key: &str| {
+        job.get("settings")
+            .and_then(|s| s.get(key))
+            .and_then(Value::as_str)
+    };
+    let distri = setting("DISTRI");
+    let version = setting("VERSION").unwrap_or("");
+    let num = step.get("num").and_then(Value::as_u64).unwrap_or(0);
+
+    let screenshot = step
+        .get("screenshot")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = screenshot {
+        validate_filename(name).map_err(|e| format!("step screenshot: {}", e.message))?;
+    }
+    let screenshot_url = screenshot.map(|name| {
+        format!(
+            "{base_url}{}",
+            test_image_path(job_id, name).trim_start_matches('/')
+        )
+    });
+
+    let matched_name = step
+        .get("needle")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty());
+    let mut needles = Vec::new();
+    if let Some(name) = matched_name {
+        needles.push(candidate(
+            name,
+            true,
+            mean_similarity(step.get("area")),
+            step.get("json").and_then(Value::as_str),
+            distri,
+            version,
+            base_url,
+        ));
+    }
+    let mut others: Vec<NeedleCandidate> = step
+        .get("needles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|n| {
+            let name = n.get("name").and_then(Value::as_str)?;
+            (Some(name) != matched_name).then(|| {
+                candidate(
+                    name,
+                    false,
+                    mean_similarity(n.get("area")),
+                    n.get("json").and_then(Value::as_str),
+                    distri,
+                    version,
+                    base_url,
+                )
+            })
+        })
+        .collect();
+    others.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    needles.extend(others);
+
+    Ok(NeedleStep {
+        module: module.to_string(),
+        step: num,
+        url: format!("{base_url}tests/{job_id}#step/{module}/{num}"),
+        result: step
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        tags: step
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect(),
+        screenshot: screenshot.map(str::to_string),
+        screenshot_url,
+        needles,
+    })
+}
+
 /// Whether `name` is listed in `/details`'s `logs`/`ulogs` arrays — used to
 /// skip probing `serial_terminal.txt` on jobs that never wrote one, instead
 /// of costing a 404.
@@ -1607,5 +1851,143 @@ mod tests {
         });
         assert!(has_log(&details, "serial_terminal.txt"));
         assert!(!has_log(&details, "video.webm"));
+    }
+
+    #[test]
+    fn image_paths_encode_segments_and_query() {
+        assert_eq!(test_image_path(7, "a b.png"), "/tests/7/images/a%20b.png");
+        assert_eq!(
+            needle_image_path("sle", "boot grub", "15-SP6"),
+            "/needles/sle/boot%20grub.png?version=15-SP6"
+        );
+        assert_eq!(
+            needle_image_path("sle", "boot", ""),
+            "/needles/sle/boot.png"
+        );
+    }
+
+    #[test]
+    fn is_png_checks_the_signature() {
+        assert!(is_png(b"\x89PNG\r\n\x1a\n\0\0"));
+        assert!(!is_png(b"GIF89a"));
+        assert!(!is_png(b"\x89PNG"));
+    }
+
+    fn step_details() -> Value {
+        serde_json::json!({"job": {
+            "settings": {"DISTRI": "sle", "VERSION": "15-SP6"},
+            "testresults": [{"name": "boot", "details": [
+                {"num": 1, "result": "ok"},
+                {"num": 2, "result": "fail", "screenshot": "boot-2.png", "tags": ["grub", "menu"],
+                 "needles": [
+                    {"name": "b", "json": "b.json", "area": [{"similarity": 0.5}, {"similarity": 0.7}]},
+                    {"name": "a", "area": [{"similarity": 0.6}]},
+                    {"name": "c", "area": [{"similarity": 0.95}]},
+                    {"name": "z"}
+                 ]},
+                {"num": 3, "result": "ok", "screenshot": "boot-3.png", "needle": "m",
+                 "json": "m.json", "area": [{"similarity": 1.0}],
+                 "needles": [{"name": "m", "area": [{"similarity": 1.0}]},
+                             {"name": "x", "area": [{"similarity": 0.2}]}]}
+            ]}]
+        }})
+    }
+
+    fn base() -> reqwest::Url {
+        reqwest::Url::parse("https://openqa.suse.de/").unwrap()
+    }
+
+    #[test]
+    fn find_step_matches_module_then_num() {
+        let details = step_details();
+        assert_eq!(
+            find_step(&details, "boot", 2).unwrap()["screenshot"],
+            "boot-2.png"
+        );
+        assert!(find_step(&details, "boot", 9).is_none());
+        assert!(find_step(&details, "nope", 2).is_none());
+    }
+
+    #[test]
+    fn needle_step_sorts_candidates_by_mean_similarity_then_name() {
+        let details = step_details();
+        let step = find_step(&details, "boot", 2).unwrap();
+        let out = needle_step(&details, step, "boot", 50, &base()).unwrap();
+
+        let names: Vec<_> = out.needles.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["c", "a", "b", "z"]);
+        assert!(
+            (out.needles[2].score - 0.6).abs() < 1e-9,
+            "mean of 0.5 and 0.7"
+        );
+        assert!(out.needles[3].score.abs() < f64::EPSILON);
+        assert_eq!(out.tags, ["grub", "menu"]);
+        assert_eq!(out.screenshot.as_deref(), Some("boot-2.png"));
+        assert_eq!(
+            out.screenshot_url.as_deref(),
+            Some("https://openqa.suse.de/tests/50/images/boot-2.png")
+        );
+        assert_eq!(out.url, "https://openqa.suse.de/tests/50#step/boot/2");
+        assert_eq!(
+            out.needles[2].image_path.as_deref(),
+            Some("/needles/sle/b.png?version=15-SP6")
+        );
+    }
+
+    #[test]
+    fn needle_step_puts_the_matched_needle_first_without_duplicating_it() {
+        let details = step_details();
+        let step = find_step(&details, "boot", 3).unwrap();
+        let out = needle_step(&details, step, "boot", 50, &base()).unwrap();
+
+        let names: Vec<_> = out.needles.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["m", "x"]);
+        assert!(out.needles[0].matched);
+        assert!(!out.needles[1].matched);
+        assert_eq!(out.needles[0].json.as_deref(), Some("m.json"));
+    }
+
+    #[test]
+    fn needle_step_without_a_screenshot_reports_none() {
+        let details = step_details();
+        let step = find_step(&details, "boot", 1).unwrap();
+        let out = needle_step(&details, step, "boot", 50, &base()).unwrap();
+        assert!(out.screenshot.is_none() && out.screenshot_url.is_none());
+        assert!(out.needles.is_empty());
+    }
+
+    #[test]
+    fn needle_step_rejects_an_unsafe_screenshot_and_flags_an_unsafe_needle() {
+        let details = step_details();
+        let bad_shot = serde_json::json!({"num": 1, "screenshot": "../x.png"});
+        assert!(needle_step(&details, &bad_shot, "boot", 1, &base()).is_err());
+
+        let bad_needle = serde_json::json!({"num": 1, "needles": [{"name": "a/b"}]});
+        let out = needle_step(&details, &bad_needle, "boot", 1, &base()).unwrap();
+        assert!(out.needles[0].image_path.is_none());
+        assert!(out.needles[0].image_error.is_some());
+    }
+
+    #[test]
+    fn needle_step_without_distri_flags_every_candidate() {
+        let details = serde_json::json!({"job": {"settings": {}}});
+        let step = serde_json::json!({"num": 1, "needles": [{"name": "a"}]});
+        let out = needle_step(&details, &step, "boot", 1, &base()).unwrap();
+        assert!(out.needles[0].image_path.is_none());
+        assert!(
+            out.needles[0]
+                .image_error
+                .as_deref()
+                .unwrap()
+                .contains("DISTRI")
+        );
+    }
+
+    #[test]
+    fn bail_message_extracts_both_bail_shapes() {
+        let tool = tool_error("not_found", Some(404), "missing thing", None);
+        assert_eq!(bail_message(tool), "missing thing");
+        let proto: Bail = Err(ErrorData::internal_error("boom", None));
+        assert_eq!(bail_message(proto), "boom");
     }
 }

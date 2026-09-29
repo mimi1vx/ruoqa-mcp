@@ -20,6 +20,11 @@ pub(crate) const MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 /// Cap on how many entries `list_job_log_members` reports from one tar
 /// archive, so a hostile or huge archive can't produce an unbounded reply.
 pub(crate) const MAX_ARCHIVE_MEMBERS: usize = 5000;
+/// `get_step_needles`: per-image ceiling (screenshot and each needle PNG).
+pub(crate) const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+/// `get_step_needles`: upper bound on `max_candidates`, keeping the reply to
+/// a handful of images.
+pub(crate) const MAX_NEEDLE_CANDIDATES: usize = 3;
 /// Bytes read by the initial `Range: bytes=0-511` probe: enough to sniff
 /// gzip/xz/tar magic bytes and, on a 206, learn the artifact's total size.
 pub(crate) const PROBE_BYTES: u64 = 512;
