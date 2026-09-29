@@ -1,23 +1,25 @@
-//! The 29 read tools (port of the READ section of `server.py`, plus the job-
+//! The 31 read tools (port of the READ section of `server.py`, plus the job-
 //! log-artifact tools that have no equivalent there).
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::Method;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::classify;
+use crate::error::{classify, tool_error};
 use crate::query::{Query, api};
 use crate::server::{OpenQaServer, ok, to_result};
 use crate::summary::summarize_jobs;
 use crate::tools::artifact;
 use crate::tools::{
     DIGEST_CONTEXT_LINES, DIGEST_MAX_HITS, DIGEST_TAIL_LINES, MAX_ARCHIVE_MEMBERS,
-    MAX_ARTIFACT_BYTES, MAX_IDS, PROBE_BYTES, bounded,
+    MAX_ARTIFACT_BYTES, MAX_IDS, MAX_IMAGE_BYTES, MAX_NEEDLE_CANDIDATES, PROBE_BYTES, bounded,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -273,6 +275,24 @@ pub struct GetJobLogErrors {
     /// `serial_terminal.txt` tier, which is tied to that one file.
     #[serde(default)]
     pub filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetStepNeedles {
+    /// Which configured openQA server to query. Call `list_servers` to
+    /// discover valid values (including aliases like `osd`/`o3`).
+    pub server: String,
+    pub job_id: i64,
+    /// Test module name, e.g. from `get_job_log_errors`' `failed_modules`.
+    pub module: String,
+    /// Step number within the module: the `<num>` of `#step/<module>/<num>`.
+    #[schemars(range(min = 1))]
+    pub step: i64,
+    /// How many candidate needle images to return besides the screenshot
+    /// (default 1, at most 3). The matched needle, if any, counts first.
+    #[serde(default)]
+    #[schemars(range(max = MAX_NEEDLE_CANDIDATES))]
+    pub max_candidates: Option<usize>,
 }
 
 /// Pull the `jobs` array a summary is built from, rejecting any shape other
@@ -1222,6 +1242,103 @@ the log carries them.",
             total_lines: text.lines().count(),
         };
         digest_reply(job_id, "tail", &scan_file, &scan, failed_modules, None)
+    }
+
+    #[tool(
+        description = "Return the screenshot of one test step and its best-scoring needle \
+candidates as MCP image content, after a JSON block naming them (`images` lists the image blocks \
+in order). `module` and `step` are required: take them from `get_job_log_errors` \
+(`failed_modules[].steps[]`, the `#step/<module>/<num>` link). The matched needle, if any, comes \
+first; the rest are ordered by mean similarity. A needle whose image can't be fetched is reported \
+as `image_error` and skipped; a missing screenshot fails the call. Each image is capped at 4 MiB.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_step_needles(
+        &self,
+        Parameters(GetStepNeedles {
+            server,
+            job_id,
+            module,
+            step,
+            max_candidates,
+        }): Parameters<GetStepNeedles>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = self.resolve_server(&server)?;
+        let max_candidates = max_candidates.unwrap_or(1);
+        bounded("max_candidates", max_candidates, 0, MAX_NEEDLE_CANDIDATES)?;
+        let step_num = u64::try_from(step)
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| ErrorData::invalid_params("step must be at least 1", None))?;
+
+        let details = match self
+            .request_json(
+                &ctx,
+                client,
+                Method::GET,
+                &api(&format!("jobs/{job_id}/details")),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return classify(e),
+        };
+        let Some(entry) = artifact::find_step(&details, &module, step_num) else {
+            return tool_error(
+                "not_found",
+                None,
+                format!("job {job_id} has no step {module}/{step_num}"),
+                None,
+            );
+        };
+        let mut needle_step =
+            match artifact::needle_step(&details, entry, &module, job_id, client.base_url()) {
+                Ok(s) => s,
+                Err(message) => return tool_error("invalid_response", None, message, None),
+            };
+        let Some(screenshot) = needle_step.screenshot.clone() else {
+            return tool_error("not_found", None, "step has no screenshot", None);
+        };
+
+        let shot_path = artifact::test_image_path(job_id, &screenshot);
+        let shot = match artifact::fetch_bytes(client, &ctx, &shot_path, MAX_IMAGE_BYTES).await {
+            Ok(b) => b,
+            Err(bail) => return bail,
+        };
+        if !artifact::is_png(&shot) {
+            return tool_error(
+                "unsupported_media",
+                None,
+                format!("screenshot {screenshot:?} is not a PNG"),
+                None,
+            );
+        }
+
+        let mut images = vec![("screenshot".to_string(), shot)];
+        for candidate in needle_step.needles.iter_mut().take(max_candidates) {
+            let Some(path) = candidate.image_path.as_deref() else {
+                continue;
+            };
+            match artifact::fetch_bytes(client, &ctx, path, MAX_IMAGE_BYTES).await {
+                Ok(b) if artifact::is_png(&b) => {
+                    images.push((format!("needle:{}", candidate.name), b));
+                }
+                Ok(_) => candidate.image_error = Some("not a PNG".to_string()),
+                Err(bail) => candidate.image_error = Some(artifact::bail_message(bail)),
+            }
+        }
+
+        let mut reply = json!(needle_step);
+        reply["job_id"] = json!(job_id);
+        reply["images"] = json!(images.iter().map(|(label, _)| label).collect::<Vec<_>>());
+        let mut content = vec![ContentBlock::json(reply)?];
+        content.extend(
+            images
+                .iter()
+                .map(|(_, bytes)| ContentBlock::image(STANDARD.encode(bytes), "image/png")),
+        );
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(

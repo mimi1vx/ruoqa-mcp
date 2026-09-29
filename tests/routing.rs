@@ -1,4 +1,4 @@
-//! Table-driven request-shape check for all 44 registered tools: method,
+//! Table-driven request-shape check for all 45 registered tools: method,
 //! path, query string, and body/form-encoding. `tests/tools.rs` asserts
 //! response handling and edge cases; this file asserts only where and how
 //! each tool's request goes out, so a typo'd `format!` path or a `GET` where
@@ -440,11 +440,18 @@ fn cases() -> Vec<Case> {
 /// can't satisfy this file's exactly-one-request-per-case assumption.
 /// `get_job_log_errors` issues a `/details` fetch plus a conditional number
 /// of tier fetches, same problem.
+/// `get_step_needles` fetches `/details`, then a screenshot and needle image
+/// that only exist when `/details` names them.
 /// `list_servers` sends no request at all (it just echoes the configured
 /// registry), so it has no place in a matrix whose whole purpose is request
 /// shape; excluded here rather than forcing `Case` to represent a no-request
 /// tool.
-const COVERED_OUTSIDE_MATRIX: &[&str] = &["list_job_logs", "get_job_log_errors", "list_servers"];
+const COVERED_OUTSIDE_MATRIX: &[&str] = &[
+    "list_job_logs",
+    "get_job_log_errors",
+    "get_step_needles",
+    "list_servers",
+];
 
 /// Names covered by [`cases`] plus [`COVERED_OUTSIDE_MATRIX`], for the
 /// coverage-ratchet guard test below.
@@ -626,5 +633,60 @@ async fn get_job_log_errors_requests_details_then_serial_terminal_and_skips_auto
             .iter()
             .all(|r| r.url.path() != "/tests/50/file/autoinst-log.txt"),
         "a tap-tier hit must never fetch autoinst-log.txt: {requests:?}"
+    );
+}
+
+/// `get_step_needles` fetches `/details`, then the screenshot, then the
+/// needle image with `version` in its query.
+#[tokio::test]
+async fn get_step_needles_requests_details_then_screenshot_then_needle() {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest";
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs/50/details"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {
+                "settings": {"DISTRI": "sle", "VERSION": "15-SP6"},
+                "testresults": [{"name": "boot", "details": [{
+                    "num": 3,
+                    "screenshot": "boot-3.png",
+                    "needles": [{"name": "boot-grub", "json": "/needles/boot-grub.json",
+                                 "area": [{"similarity": 0.9}]}]
+                }]}]
+            }
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tests/50/images/boot-3.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/needles/sle/boot-grub.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG))
+        .mount(&mock)
+        .await;
+    let client = run_server(&mock).await;
+
+    call(
+        &client,
+        "get_step_needles",
+        &json!({"job_id": 50, "module": "boot", "step": 3}),
+    )
+    .await;
+
+    let requests = mock.received_requests().await.expect("recorded requests");
+    let seen: Vec<(&str, Option<&str>)> = requests
+        .iter()
+        .map(|r| (r.url.path(), r.url.query()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("/api/v1/jobs/50/details", None),
+            ("/tests/50/images/boot-3.png", None),
+            ("/needles/sle/boot-grub.png", Some("version=15-SP6")),
+        ]
     );
 }

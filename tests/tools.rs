@@ -2049,3 +2049,250 @@ async fn two_servers_route_independently() {
         1
     );
 }
+
+// --- get_step_needles --------------------------------------------------
+
+const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+fn png(tail: &[u8]) -> Vec<u8> {
+    [PNG_HEADER, tail].concat()
+}
+
+/// Mounts a `/details` for job `id` with one failed `boot` step (num 2)
+/// carrying two candidate needles, `good` scoring above `weak`.
+async fn mount_step_details(mock: &MockServer, id: i64) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/jobs/{id}/details")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"job": {
+            "settings": {"DISTRI": "sle", "VERSION": "15-SP6"},
+            "testresults": [{"name": "boot", "details": [
+                {"num": 1, "result": "ok"},
+                {"num": 2, "result": "fail", "screenshot": "boot-2.png", "tags": ["grub"],
+                 "needles": [
+                    {"name": "weak", "area": [{"similarity": 0.3}]},
+                    {"name": "good", "json": "good.json", "area": [{"similarity": 0.8}]}
+                 ]}
+            ]}]
+        }})))
+        .mount(mock)
+        .await;
+}
+
+async fn mount_png(mock: &MockServer, url_path: &str, body: Vec<u8>) {
+    Mock::given(method("GET"))
+        .and(path(url_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(mock)
+        .await;
+}
+
+fn image_blocks(result: &rmcp::model::CallToolResult) -> Vec<(String, Vec<u8>)> {
+    use base64::Engine as _;
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_image())
+        .map(|img| {
+            (
+                img.mime_type.clone(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(&img.data)
+                    .expect("valid base64"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn get_step_needles_returns_summary_screenshot_and_best_needle() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 60).await;
+    mount_png(&mock, "/tests/60/images/boot-2.png", png(b"shot")).await;
+    mount_png(&mock, "/needles/sle/good.png", png(b"good")).await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 60, "module": "boot", "step": 2}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(result.content.len(), 3);
+    let summary = text(&result);
+    assert_eq!(summary["images"], json!(["screenshot", "needle:good"]));
+    assert_eq!(summary["needles"][0]["name"], "good");
+    assert_eq!(summary["needles"][1]["name"], "weak");
+    assert_eq!(summary["tags"], json!(["grub"]));
+    let images = image_blocks(&result);
+    assert_eq!(
+        images,
+        [
+            ("image/png".to_string(), png(b"shot")),
+            ("image/png".to_string(), png(b"good")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_step_needles_needle_404_is_a_soft_error() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 61).await;
+    mount_png(&mock, "/tests/61/images/boot-2.png", png(b"shot")).await;
+    Mock::given(method("GET"))
+        .and(path("/needles/sle/good.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 61, "module": "boot", "step": 2}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(image_blocks(&result).len(), 1);
+    let summary = text(&result);
+    assert_eq!(summary["images"], json!(["screenshot"]));
+    assert!(
+        summary["needles"][0]["image_error"]
+            .as_str()
+            .is_some_and(|m| m.contains("404")),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn get_step_needles_max_candidates_zero_returns_only_the_screenshot() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 62).await;
+    mount_png(&mock, "/tests/62/images/boot-2.png", png(b"shot")).await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 62, "module": "boot", "step": 2, "max_candidates": 0}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(image_blocks(&result).len(), 1);
+    let requests = mock.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().starts_with("/needles/"))
+    );
+}
+
+#[tokio::test]
+async fn get_step_needles_max_candidates_over_limit_is_invalid_params() {
+    let mock = MockServer::start().await;
+    let client = server_with_mock(&mock, true).await;
+
+    let err = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 1, "module": "boot", "step": 2, "max_candidates": 4}),
+    )
+    .await
+    .expect_err("max_candidates 4 must be rejected");
+
+    let rmcp::ServiceError::McpError(mcp_err) = err else {
+        panic!("expected McpError, got {err:?}");
+    };
+    assert_eq!(mcp_err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(mock.received_requests().await.expect("requests").is_empty());
+}
+
+#[tokio::test]
+async fn get_step_needles_non_png_screenshot_is_a_tool_error() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 63).await;
+    mount_png(
+        &mock,
+        "/tests/63/images/boot-2.png",
+        b"<html>nope</html>".to_vec(),
+    )
+    .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 63, "module": "boot", "step": 2}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "unsupported_media");
+}
+
+#[tokio::test]
+async fn get_step_needles_oversized_screenshot_is_response_too_large() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 64).await;
+    mount_png(
+        &mock,
+        "/tests/64/images/boot-2.png",
+        png(&vec![0u8; 4 * 1024 * 1024]),
+    )
+    .await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 64, "module": "boot", "step": 2}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "response_too_large");
+}
+
+#[tokio::test]
+async fn get_step_needles_unknown_module_or_step_is_not_found() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 65).await;
+    let client = server_with_mock(&mock, true).await;
+
+    for (module, step) in [("nope", 2), ("boot", 9)] {
+        let result = call(
+            &client,
+            "get_step_needles",
+            json!({"job_id": 65, "module": module, "step": step}),
+        )
+        .await
+        .expect("call_tool");
+        assert_eq!(result.is_error, Some(true), "{module}/{step}");
+        assert_eq!(text(&result)["error"]["kind"], "not_found");
+    }
+}
+
+#[tokio::test]
+async fn get_step_needles_step_without_screenshot_is_not_found() {
+    let mock = MockServer::start().await;
+    mount_step_details(&mock, 66).await;
+    let client = server_with_mock(&mock, true).await;
+
+    let result = call(
+        &client,
+        "get_step_needles",
+        json!({"job_id": 66, "module": "boot", "step": 1}),
+    )
+    .await
+    .expect("call_tool");
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(text(&result)["error"]["kind"], "not_found");
+}
