@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/os-autoinst/ruoqa-mcp/compare/v0.6.1...v0.6.2) - 2026-10-07
+
+### Other
+
+- *(deps)* bump base64 from 0.22.1 to 0.23.1
+- *(deps)* bump the cargo-minor-patch group across 1 directory with 3 updates
+- satisfy clippy assert_is_empty lint
+
 ## [0.6.1](https://github.com/mimi1vx/ruoqa-mcp/compare/v0.6.0...v0.6.1) - 2026-09-29
 
 ### Added
