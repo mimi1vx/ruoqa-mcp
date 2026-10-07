@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn an_empty_file_yields_nothing() {
-        assert!(parse("").is_empty());
-        assert!(parse("# only a comment\n").is_empty());
+        assert_eq!(parse(""), Vec::<(String, String)>::new());
+        assert_eq!(parse("# only a comment\n"), Vec::<(String, String)>::new());
     }
 }

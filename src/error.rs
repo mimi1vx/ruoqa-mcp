@@ -250,7 +250,7 @@ mod tests {
         let truncated = truncate(&body, BODY_PREVIEW_BYTES);
         assert!(truncated.len() <= BODY_PREVIEW_BYTES);
         // Must still be valid UTF-8 (a panic would already have failed this).
-        assert!(!truncated.is_empty());
+        assert_ne!(truncated, "");
     }
 
     #[test]

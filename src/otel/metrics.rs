@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn collect_on_an_empty_registry_returns_empty() {
         let registry = Registry::new(0);
-        assert!(registry.collect(0).is_empty());
+        assert_eq!(registry.collect(0), Vec::<Vec<u8>>::new());
     }
 
     #[test]
