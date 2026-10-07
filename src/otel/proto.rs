@@ -262,7 +262,7 @@ mod tests {
     fn packed_fixed64_empty_writes_nothing() {
         let mut buf = Vec::new();
         write_packed_fixed64(&mut buf, 3, &[]);
-        assert!(buf.is_empty());
+        assert_eq!(buf, Vec::<u8>::new());
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
     fn packed_double_empty_writes_nothing() {
         let mut buf = Vec::new();
         write_packed_double(&mut buf, 7, &[]);
-        assert!(buf.is_empty());
+        assert_eq!(buf, Vec::<u8>::new());
     }
 
     #[test]

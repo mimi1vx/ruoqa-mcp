@@ -157,7 +157,7 @@ mod tests {
         assert!(!cli.readonly());
         assert!(matches!(cli.transport().unwrap(), Transport::Stdio));
         assert!(!cli.insecure_no_auth);
-        assert!(cli.allowed_hosts.is_empty());
+        assert_eq!(cli.allowed_hosts, Vec::<String>::new());
         assert!(cli.audit_config.is_none());
 
         let cli = Cli::parse_from([
